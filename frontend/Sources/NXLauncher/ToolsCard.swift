@@ -1,27 +1,32 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import NXCore
 import NXModel
 
 /// Settings, "Tools": the repository or the release app's engine, the dependency rows and the diagnostics row.
 /// Observes the repository, engine sync and dependency stores. What it needs from the build store comes as values:
-/// whether a build runs. The cache row (ShellCacheRow, which observes the build store) and the diagnostics button come as views.
-package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
+/// whether a build runs. The cache row (ShellCacheRow, which observes the build store), the experimental builder's rows (ExperimentalBuilderRow, the same)
+/// and the diagnostics button come as views.
+package struct ToolsCard<Diagnostics: View, ShellCache: View, Builder: View>: View {
     @ObservedObject var repo: RepoStore
     @ObservedObject var engine: EngineSyncStore
     @ObservedObject var dependencies: DependencyStore
+    @State private var invalidXcode = false
     let buildRunning: Bool
     let shellCache: ShellCache
+    let builder: Builder
     let diagnostics: Diagnostics
     @EnvironmentObject var loc: Localizer
 
     package init(repo: RepoStore, engine: EngineSyncStore, dependencies: DependencyStore, buildRunning: Bool,
-                 @ViewBuilder shellCache: () -> ShellCache, @ViewBuilder diagnostics: () -> Diagnostics) {
+                 @ViewBuilder shellCache: () -> ShellCache, @ViewBuilder builder: () -> Builder, @ViewBuilder diagnostics: () -> Diagnostics) {
         self.repo = repo
         self.engine = engine
         self.dependencies = dependencies
         self.buildRunning = buildRunning
         self.shellCache = shellCache()
+        self.builder = builder()
         self.diagnostics = diagnostics()
     }
 
@@ -61,14 +66,14 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
                 // GitHub does not load everywhere: the manual route (Code → Download ZIP → unzip →
                 // Choose repository) needs no git at all, and the note says which folder to pick.
                 HStack(spacing: 4) {
-                    Text(loc.t("repo.manualHint")).foregroundStyle(.secondary)
+                    Text(loc.t("repo.manualHint")).foregroundStyle(LauncherPalette.secondaryText)
                     Link("github.com/LNPANDY/NX2Apple", destination: URL(string: RepoStore.url.replacingOccurrences(of: ".git", with: ""))!)
-                    Text(loc.t("repo.manualHint2")).foregroundStyle(.secondary)
+                    Text(loc.t("repo.manualHint2")).foregroundStyle(LauncherPalette.secondaryText)
                 }
                 .font(.manrope(12)).padding(.horizontal, 18).padding(.bottom, 12)
             }
             if repo.isRepo, !repo.isGit {
-                Text(loc.t(repo.autoUpdate ? "repo.noGit" : "repo.zipNoAuto")).font(.manrope(12)).foregroundStyle(.secondary)
+                Text(loc.t(repo.autoUpdate ? "repo.noGit" : "repo.zipNoAuto")).font(.manrope(12)).foregroundStyle(LauncherPalette.secondaryText)
                     .padding(.horizontal, 18).padding(.bottom, 12)
             }
             if repo.isRepo, !RepoLayout.missingTools(in: repo.path).isEmpty {
@@ -79,10 +84,19 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
             if repo.isRepo {   // a ZIP copy too: its adoption at launch follows this switch
                 CardDivider()
                 CardRow(loc.t("repo.auto"), detail: loc.t("repo.autoNote")) {
-                    Toggle("", isOn: $repo.autoUpdate).labelsHidden().toggleStyle(LauncherSwitchStyle())
+                    Toggle(loc.t("repo.auto"), isOn: $repo.autoUpdate).labelsHidden().toggleStyle(LauncherSwitchStyle())
                 }
             }
             }
+            CardDivider()
+            CardRow(loc.t("xcodeChoice.title"), detail: dependencies.xcodeApp ?? loc.t("xcodeChoice.system")) {
+                if dependencies.xcodeApp != nil {
+                    Button(loc.t("xcodeChoice.reset")) { dependencies.selectXcode(nil) }
+                }
+                Button(loc.t("xcodeChoice.choose")) { pickXcode() }
+            }
+            .disabled(buildRunning || dependencies.deps.contains(where: \.installing))
+            .alert(loc.t("xcodeChoice.invalid"), isPresented: $invalidXcode) {}
             CardDivider()
             Button(action: { withAnimation(.easeInOut(duration: 0.18)) { dependencies.toggle() } }) {
                 CardRow(loc.t("dep.title"),
@@ -106,7 +120,7 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
                             if d.installing {
                                 ProgressView().controlSize(.small)
                                 Text(loc.t("dep.installing")).font(.manrope(12)).foregroundStyle(LauncherPalette.building)
-                            } else if !d.present {
+                            } else if !d.present && !(d.id == "xcode" && dependencies.xcodeApp != nil && d.installCmd.isEmpty) {
                                 Button(d.actionLabel.isEmpty ? (d.installCmd.isEmpty ? loc.t("dep.openAppStore") : loc.t("dep.install")) : loc.t(d.actionLabel)) { _ = dependencies.install(d) }
                             }
                         }
@@ -117,7 +131,7 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
                                 Text(d.lastError).font(.mono(11)).foregroundStyle(LauncherPalette.building)
                                     .lineLimit(3).help(d.lastError)
                                 if !d.fixHint.isEmpty {
-                                    Text(loc.t(d.fixHint)).font(.manrope(11.5)).foregroundStyle(.secondary)
+                                    Text(loc.t(d.fixHint)).font(.manrope(11.5)).foregroundStyle(LauncherPalette.secondaryText)
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
@@ -127,6 +141,8 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
                     }
                 }
             }
+            CardDivider()
+            builder
             CardDivider()
             CardRow(loc.t("diag.title"), detail: loc.t("diag.note")) { diagnostics }
         }
@@ -147,14 +163,20 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
         }
         CardDivider()
         // A different channel is asked about first (the alert below): the switch can recompile every game's shaders
-        CardRow(loc.t("engine.update"), detail: loc.t("engine.channelNote"), dot: LauncherPalette.ready) {
-            LauncherDropdown(options: EngineChannel.allCases.map { (value: $0.rawValue, label: loc.t($0.labelKey)) },
+        // Experimental older than or equal to Stable (#1095): no switch to it, and a way back when the launcher is on it
+        let choice = engine.channelChoice
+        CardRow(loc.t("engine.update"), detail: loc.t(choice.noteKey ?? "engine.channelNote"), dot: LauncherPalette.ready) {
+            if choice.offersBackToStable {
+                Button(loc.t("engine.backToStable")) { engine.requestChannel(.stable) }.disabled(!idle)
+                    .padTarget("set.engineBack", scope: "main") { if idle { engine.requestChannel(.stable) } }
+            }
+            LauncherDropdown(options: choice.options.map { (value: $0.rawValue, label: loc.t($0.labelKey)) },
                              selection: engine.selection.channel.rawValue) { v in
                 if let channel = EngineChannel(rawValue: v) { engine.requestChannel(channel) }
             }
             .disabled(!idle)
             .padTarget("set.engineChannel", scope: "main") {
-                if idle { engine.requestChannel(engine.selection.channel == .stable ? .experimental : .stable) }
+                if idle { engine.requestChannel(engine.selection.channel == .stable ? .experimental : .stable) }   // refused while Experimental is not ahead
             }
         }
         .alert(loc.t("engine.switch.title"), isPresented: Binding(get: { engine.confirmingChannel != nil },
@@ -170,7 +192,16 @@ package struct ToolsCard<Diagnostics: View, ShellCache: View>: View {
         shellCache
         CardDivider()
         CardRow(loc.t("repo.auto"), detail: loc.t("engine.autoNote")) {
-            Toggle("", isOn: $repo.autoUpdate).labelsHidden().toggleStyle(LauncherSwitchStyle())
+            Toggle(loc.t("repo.auto"), isOn: $repo.autoUpdate).labelsHidden().toggleStyle(LauncherSwitchStyle())
+        }
+    }
+
+    private func pickXcode() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.message = loc.t("xcodeChoice.message")
+        if panel.runModal() == .OK, let url = panel.url {
+            invalidXcode = !dependencies.selectXcode(url)
         }
     }
 

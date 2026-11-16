@@ -62,6 +62,57 @@ final class TouchControlsCaptureTests: XCTestCase {
         }
     }
 
+    /// The layout editor (#414): a phone held sideways and upright, 2D and 3D, a chosen control, a moved one, a refused spot, and an
+    /// iPad upright with the controls below the picture.
+    func testCaptureTheLayoutEditor() throws {
+        var moved = TouchLayout()
+        moved[.threeD, .face] = TouchLayout.Offset(dx: -4, dy: -3)
+        moved[.threeD, .stick] = TouchLayout.Offset(dx: 0, dy: -4)
+        moved[.threeD, .plus] = TouchLayout.Offset(dx: 2, dy: 1)
+        let store = store([ShellSettingsStore.touchLayoutKey: moved.encoded])
+        func editor(_ kind: TouchLayout.Kind, upright: PadScreen? = nil, select: TouchLayout.Control? = nil, rejected: Bool = false, held: Bool = false) -> TouchLayoutEditorModel {
+            let m = TouchLayoutEditorModel(store: store, sideways: .proMax, upright: upright, kind: kind)
+            if let select { held ? m.pickUp(select) : m.select(select) }
+            if rejected { m.nudge(dx: 40, dy: 0) }   // the stick toward the diamond: no room
+            return m
+        }
+        try capture("touch-editor-phone-sideways", width: 932, height: 430, TouchLayoutEditorView(model: editor(.threeD, select: .stick), close: {}))
+        try capture("touch-editor-phone-upright", width: 402, height: 874, TouchLayoutEditorView(model: editor(.threeD, select: .face), close: {}))
+        try capture("touch-editor-2d", width: 932, height: 430, TouchLayoutEditorView(model: editor(.twoD), close: {}))
+        try capture("touch-editor-refused", width: 932, height: 430, TouchLayoutEditorView(model: editor(.threeD, select: .stick, rejected: true), close: {}))
+        try capture("touch-editor-held", width: 932, height: 430, TouchLayoutEditorView(model: editor(.threeD, select: .plus, held: true), close: {}))
+        try capture("touch-editor-ipad-upright", width: 1032, height: 1376,
+                    TouchLayoutEditorView(model: editor(.threeDSplit, upright: .iPadUpright, select: .x), close: {}))
+        try capture("touch-settings-arranged", width: 402, height: 1400, ShellSettingsView(store: store, actions: ShellActions(), onClose: {}))
+    }
+
+    /// The editor on real screens, inside each device's safe area (what the view gets on the device), with the outside drawn black: the
+    /// smallest and the largest iPhone held sideways, an iPhone with a notch, and an iPad held sideways. A chosen control in 3D.
+    func testCaptureTheLayoutEditorOnDevices() throws {
+        struct Device { var name: String; var window: CGSize; var insets: EdgeInsets; var pad = false }
+        let devices = [
+            Device(name: "se", window: CGSize(width: 667, height: 375), insets: EdgeInsets()),
+            Device(name: "mini", window: CGSize(width: 812, height: 375), insets: EdgeInsets(top: 0, leading: 50, bottom: 21, trailing: 50)),
+            Device(name: "promax", window: CGSize(width: 956, height: 440), insets: EdgeInsets(top: 0, leading: 62, bottom: 21, trailing: 62)),
+            Device(name: "ipad", window: CGSize(width: 1376, height: 1032), insets: EdgeInsets(top: 24, leading: 0, bottom: 20, trailing: 0), pad: true),
+        ]
+        for d in devices {
+            let screens = TouchLayoutScreens.device(window: d.window, insets: d.insets, isPad: d.pad)
+            let m = TouchLayoutEditorModel(store: store(), sideways: screens.sideways, upright: screens.upright, kind: .threeD)
+            m.select(.face)
+            let view = TouchLayoutEditorView(model: m, close: {}).padding(d.insets).background(Color.black)
+            try capture("touch-editor-device-\(d.name)", width: d.window.width, height: d.window.height, view)
+            // The end of the column, with a moved control and Reset all asking: nothing below is cut off, it scrolls.
+            let asking = TouchLayoutEditorModel(store: store(), sideways: screens.sideways, upright: screens.upright, kind: .threeD)
+            asking.select(.face); asking.nudge(dx: -2, dy: -2); asking.askReset()
+            try capture("touch-editor-device-\(d.name)-end", width: d.window.width, height: d.window.height,
+                        TouchLayoutEditorView(model: asking, close: {}).padding(d.insets).background(Color.black))
+            let none = TouchLayoutEditorModel(store: store(), sideways: screens.sideways, upright: screens.upright, kind: .twoD)
+            try capture("touch-editor-device-\(d.name)-2d", width: d.window.width, height: d.window.height,
+                        TouchLayoutEditorView(model: none, close: {}).padding(d.insets).background(Color.black))
+        }
+    }
+
     private func captureGroup(_ name: String, _ values: [String: String]) throws {
         let s = store(values)
         let group = SettingsGroup(title: ShellStrings.text("Touch controls")) {

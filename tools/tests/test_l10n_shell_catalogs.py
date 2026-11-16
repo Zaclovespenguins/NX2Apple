@@ -58,10 +58,13 @@ class CommittedCatalogs(unittest.TestCase):
                 for code, localization in entry['localizations'].items():
                     self.assertEqual(sorted(PRINTF.findall(localization['stringUnit']['value'])), sorted(PRINTF.findall(key)), f'{code}: {key}')
 
-    def test_english_and_chinese_have_every_shell_text(self):
+    def test_every_language_has_every_shell_text(self):
+        codes = C.apple_codes(self.languages)
+        self.assertEqual(sorted(codes), sorted(['en', 'zh-Hans', 'de', 'sv', 'fr', 'it', 'ja', 'es', 'ko', 'pt-BR']))
         for target in C.CATALOGS:
             for key, entry in json.loads(C.catalog_path(target).read_text(encoding='utf-8'))['strings'].items():
-                self.assertIn('zh-Hans', entry['localizations'], f'{target}: {key} has no Chinese text')
+                self.assertEqual(sorted(entry['localizations']), sorted(codes), f'{target}: {key} lacks a language')
+        self.assertEqual(C.missing(self.languages), {})
 
     def test_every_ios_key_belongs_to_a_catalog(self):
         prefixes = tuple(p for target in C.CATALOGS for p in C.prefixes(target))
@@ -80,14 +83,12 @@ class CommittedCatalogs(unittest.TestCase):
         block = re.search(r'<key>CFBundleLocalizations</key>\s*<array>(.*?)</array>', plist, re.S)
         self.assertEqual(re.findall(r'<string>([^<]*)</string>', block.group(1)), codes, 'Demo/Gen/Info.plist is out of step with project.yml')
 
-    def test_the_shell_app_of_the_engine_declares_every_language_of_the_files(self):
-        project = ROOT / 'engine' / 'dm' / 'ios' / 'project-shell.yml'
-        if not project.exists():
-            self.skipTest('engine/ is not built (python3 tools/engine.py sync)')
+    def test_the_shell_app_declares_every_language_of_the_files(self):
+        project = ROOT / 'frontend-ios' / 'Shell' / 'project-shell.yml'
         declared = re.search(r'CFBundleLocalizations:\s*\[([^\]]*)\]', project.read_text(encoding='utf-8'))
-        self.assertIsNotNone(declared, 'dm/ios/project-shell.yml has no CFBundleLocalizations')
+        self.assertIsNotNone(declared, 'frontend-ios/Shell/project-shell.yml has no CFBundleLocalizations')
         self.assertEqual([c.strip() for c in declared.group(1).split(',')], C.apple_codes(self.languages),
-                         'dm/ios/project-shell.yml: CFBundleLocalizations are the language files, en first (a patch in patches/)')
+                         'frontend-ios/Shell/project-shell.yml: CFBundleLocalizations are the language files, en first')
 
     def test_try_local_declares_every_language_of_the_files(self):
         text = (TOOLS / 'try-local').read_text(encoding='utf-8')
@@ -116,6 +117,11 @@ class Generator(unittest.TestCase):
         strings = C.build(C.load_languages(folder), 'ios.ui.')['strings']
         self.assertIn('sv', strings['A']['localizations'])
         self.assertNotIn('sv', strings['B']['localizations'])
+
+    def test_a_language_without_a_shell_text_fails_the_check(self):
+        folder = self.folder(en={'ios.ui.a': 'A', 'ios.host.b': 'B', 'other.c': 'C'}, zh={'ios.ui.a': 'a', 'ios.host.b': 'b', 'other.c': 'c'},
+                             de={'ios.ui.a': 'dA', 'other.c': 'dC'}, sv={'ios.ui.a': 'sA', 'ios.host.b': 'sB'})
+        self.assertEqual(C.missing(C.load_languages(folder)), {'de': ['ios.host.b']}, 'only shell texts count, other keys may be missing')
 
     def test_format_specifiers_and_quotes_pass_through(self):
         folder = self.folder(en={'ios.ui.n': '"%@" is %lld of %.1f'}, zh={'ios.ui.n': '"%@" 是 %lld / %.1f'})

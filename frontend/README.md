@@ -81,7 +81,7 @@ there once at start (a rename on the same volume, shell.json's paths are rewritt
 it is the folder the launcher made, shell.json can be read and the new place is free. On any doubt
 the old folder stays where it is and keeps being used, and nothing is deleted. Uninstalling the
 launcher leaves this folder alone. The launcher
-generates the app's project with `dm/ios/tools/build_shell.sh --prepare-xcode`, signs it with
+generates the app's project with `frontend-ios/Shell/build_shell.sh --prepare-xcode`, signs it with
 `xcodebuild -allowProvisioningUpdates` and installs it over the one already there with
 `xcrun devicectl device install app`, which keeps the app's Documents. The game files are packed
 into `games/<title ID>/romfs.img`, with any DLC in `aoc/` beside it. They are compared with the
@@ -169,7 +169,7 @@ library manifest is stored at
 ## Launch options
 
 The button beside **Play** opens the game's launch options: the settings the iPhone
-launcher shows before a game starts ([docs/settings.md](https://github.com/seedds/nxnative/blob/65501fbbaf8526f7aab0a1edd028135888590f8e/docs/settings.md)), read
+launcher shows before a game starts ([docs/settings.md](https://github.com/seedds/nxnative/blob/94a0944755da1a443f42651bf7ee49ab24ed5ee5/docs/settings.md)), read
 from the list the engine packs into the Mac app (`Contents/Resources/dm/launcher.json`,
 written by `dm/games/settings.py` from `dm/games/settings.tsv`, and the engine change that
 packs it is [seedds/nxnative#352](https://github.com/seedds/nxnative/pull/352), so a
@@ -180,16 +180,45 @@ shows none. Starting the app from Finder uses its defaults.
 
 ## Controls
 
-**Settings → Controls → Customize…** sets the keys and controller buttons for every game.
+**Settings → Controls → Customize…** sets the global keyboard and controller layout.
 For a key, click its field and press the new key (Esc keeps the old one, × leaves the
 function on no key). One key holds one function, so the function that had the key before
 is left on none, as in the host. For a controller button, choose the button it sends
 (A and B swapped, for example). The right stick has no keys by default and can get some
-here. **Play** passes only the changes, as `DM_KEYMAP` and `DM_PAD_MAP`, which the host
-reads through `dm/host/input_map.h` — upstream's
-[seedds/nxnative#386](https://github.com/seedds/nxnative/pull/386), carried in this fork
-while it is open, and listed in `docs/env_switches.tsv`. A host built before the carrier
-has no `input_map.h` and ignores both, so its games play with the default keys.
+here.
+
+For rebuilt games that support saved controller mappings, **Manage → Launch options →
+Controller mapping…** opens a layout for that game. It shares standard button mappings
+with the game's controller menu, including **Shake**. The first launch or opening of
+this editor copies a changed global keyboard/controller layout only where the game has
+no saved mapping. This happens once, including when the global layout is unchanged,
+so resetting in the game's menu stays reset. **Copy global layout** explicitly replaces
+only the standard keyboard and controller maps. Steam extra inputs remain unchanged.
+The per-game editor refreshes after switching back from the game's menu.
+
+The **Steam Controller (2026)** section configures L4/R4/L5/R5, both pad clicks,
+Guide and Quick Access, the two trackpad modes and motion controls. Extra buttons are
+unbound by default, the left pad is a D-pad, the right pad is a touchscreen, and motion
+is enabled. **Reset Steam controls** resets only this section. Standard maps apply to
+all controllers for the game, while these extra settings apply to the Steam model.
+
+Existing game apps must be rebuilt with the updated engine to receive direct Steam
+Controller input and the per-game editor. The launcher checks the built app's explicit
+`DMControllerMappings=1` capability marker. Older builds continue receiving the global
+layout as `DM_KEYMAP` and `DM_PAD_MAP` at Play. New builds read those maps from the
+game's preferences, allowing the in-game panel to change them. Explicit launch overrides
+and `env.txt` retain their precedence. `DM_SAVED_CHOICES=0` prevents migration and
+preserves the legacy launch environment. No controller preferences are written while
+saved choices are disabled.
+
+Direct raw Steam input belongs to built games. Library and console navigation in
+NX2Apple continue to depend on Apple's GameController support.
+
+macOS may require **System Settings → Privacy & Security → Input Monitoring**
+permission for the game app's direct Steam input. Bluetooth pairing alone does not
+grant it. If direct input, motion or rumble is unavailable, enable the game app
+you launch there, quit and reopen it, then reconnect the controller. Replacing or
+rebuilding an ad-hoc signed app can require renewing that permission.
 
 The controller has four layouts, each only a `DM_PAD_MAP` value. **Standard layout**
 (the default) passes nothing: the host reads the face buttons by position, in the
@@ -216,8 +245,22 @@ title ID in the community title database
 from the repository, and last the built app's icon. The title list (about 90 MB) is
 downloaded only while a game in the collection has no key art yet, reduced to title
 ID → image and kept with the images in
-`~/Library/Application Support/NS Port Builder/artwork/`. Custom images stay at
-their chosen path.
+`~/Library/Application Support/NS Port Builder/artwork/`. A custom image is
+downscaled (3840 px wide at most) and copied to `artwork/custom/<game>/` beside them, so
+moving or deleting the original changes nothing. The same list names each title's
+screenshots (6 at most): they are indexed for the games asked about and
+downloaded one by one into `artwork/<title ID>/`, only when asked for. Images chosen with an earlier version are
+copied the same way at the next launch.
+
+The list can hold several shop products under one title ID: the game, its Nintendo
+Switch 2 Edition, or a bundle with a membership or an expansion pass. The launcher
+takes the game's own product. A product whose name marks an edition, a bundle, a pass
+or a demo loses, and of two equal ones the first in the shop wins. `sources.json` in
+the same folder records where each image came from. An image saved by an older
+launcher is checked once against this rule and replaced when it belongs to another
+product. A banner with a promotion painted in (for example "Demo Available") cannot be
+told from the list. Change artwork covers it. A game the list does not know, as most
+Switch 2 games today, falls back to the screenshot, the app icon or the placeholder.
 
 ## Type
 
@@ -256,6 +299,40 @@ bundle), a bundle under `.build/` or `DerivedData/`, a bundle beside
 `Package.swift` (the `NX2Apple.app` made here), or one whose Info.plist version
 is not this binary's release number. `AppUpdate.swift` holds these rules.
 
+## Experimental builder
+
+Settings, Build tools, **Use experimental builder** (off by default, LNPANDY/NX2Apple#749). nxbuild is a build tool in Rust that reproduces stages of the NSP script byte for byte, and faster. With the switch on, the build gets `DM_EXPERIMENTAL_BUILDER=1` and `NXB_BIN` (the path of the `nxb` binary). The script stays the driver. It runs the extraction (`nxb-extract`) and the shader split (`nxb-split`) through nxbuild where nxbuild supports the case, with the same outputs, stages and events. Everything else runs the standard way:
+
+- an XCI, an NSZ, a merged package, `--program`, `--allow-damaged`, DLC, run-time captures, NROs, a game decoder, a provisional or derived profile
+- an nxbuild exit code other than 0 (4 means "not supported yet")
+- an output that fails the checks: for an extraction the title, `ExeFS/main`, `RomFS.img` and the profile's marker, for the split the data rows of the profile's shader tables
+
+The build log says which stage nxbuild ran and why a stage fell back. nxbuild's own log is `logs/nxb_extract_<version>.log` or `logs/nxb_split.log` in the build folder. The shader step, the pipeline archive and the Mac app are not handed over yet. The NSP script needs the engine patch that reads the two variables. An engine without it ignores them.
+
+Where `nxb` comes from (`ExperimentalBuilder` in `NXCore`):
+
+1. The path chosen in the row under the switch, the `nxb` binary or the folder that holds it. A chosen path that does not work is reported, never replaced by another binary.
+2. Otherwise the app's own copy, `Contents/Resources/nxbuild/nxb`. `frontend/nxbuild.pin` names the nxbuild release (version, SHA-256, URL pattern). `build-mac-app.yml` and `tools/try-local` run `frontend/tools/nxbuild.py fetch`: it downloads the zip, checks its SHA-256 against the pin before anything is unpacked, puts `nxb` into Resources and signs it ad hoc. A zip whose digest differs fails the app build. A pin with `PLACEHOLDER` as its digest bundles nothing. `frontend/tools/nxbuild.py bump <version>` pins a new release with the digest from its `SHA256SUMS`. Players download nothing at run time.
+
+With neither, the switch only writes a note in the build log and the standard builder runs.
+
+To try a local nxbuild:
+
+```bash
+cd <nxbuild checkout> && cargo build --release      # the binaries land in its target folder, release/
+codesign --force --sign - <target>/release/nxb*     # ad hoc, as the app's copy
+```
+
+Then turn the switch on and choose `release/nxb` (or the folder). From a terminal, the same works without the launcher:
+
+```bash
+DM_EXPERIMENTAL_BUILDER=1 NXB_BIN=<target>/release/nxb python3 engine/scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac-app
+```
+
+The script takes a stage binary beside `nxb` (`nxb-extract`, `nxb-split`) when there is one, else the subcommand of `nxb` (`nxb extract`, `nxb split`).
+
+The Qt front end has no switch for it: nxbuild is built for macOS on Apple silicon only, and on a Mac the launcher above is the one to use.
+
 ## Run
 
 ```bash
@@ -263,8 +340,8 @@ cd frontend
 swift run
 ```
 
-or double-click `nxnative.app` in this folder (ad-hoc signed, and rebuild it with `swift build -c release`
-and copy the binary into `Contents/MacOS/`). The app's settings and library stay under the folder name it
+or double-click `nxnative.app` in this folder (ad-hoc signed, and rebuild it with `tools/build_launcher.sh`, which runs `swift build -c release`
+with the SDK on the link, and copy `.build/release/NX2Apple` into `Contents/MacOS/`). The app's settings and library stay under the folder name it
 had before the rename, `~/Library/Application Support/NS Port Builder/`.
 
 To try the app CI built for a pull request, for `main` or for a release candidate, without building it: `tools/try-pr 271`,
@@ -334,9 +411,12 @@ Windows launcher never show them. Xcode needs a string catalog per target, so
 `frontend-ios/Sources/ShellHost/Resources/Localizable.xcstrings` from the files (the catalogs are not edited by hand).
 The Swift code asks for a shell text by its English words (`ShellStrings.text("Done")`), so the catalog's key is the English
 text of the JSON key, and each language file that has the JSON key adds a localization (`zh.json` becomes `zh-Hans`, every other
-code stays as it is). A new shell text is a line in `en.json` and `zh.json` under the prefix, the same words in the Swift call
-and `python3 tools/l10n_shell_catalogs.py`. A new language file shows up in both catalogs with no change in the tool. A language
-that has no line for a key shows the English text, as in the launchers. `tools/tests/test_l10n_shell_catalogs.py` fails when a
+code stays as it is). A new shell text is a line in every language file under the prefix, the same words in the Swift call
+and `python3 tools/l10n_shell_catalogs.py`. A new language file shows up in both catalogs with no change in the tool. Unlike the
+launchers' texts, every shell text has every language: `python3 tools/l10n_shell_catalogs.py --check` fails when a language file
+lacks one, and so do `ShellStringsTests` (each catalog entry has all seven) and `ShellTextSourcesTests` (each `ShellStrings.text` and
+`hostText` literal of the sources is a catalog key) in frontend-ios. A text a language writes as English does (OK, Minus, Version)
+is listed in `ShellStringsTests.cognates` and in the German and French launcher tests. `tools/tests/test_l10n_shell_catalogs.py` fails when a
 committed catalog differs from what the files give, and when the app's `CFBundleLocalizations` (the Demo app, `tools/try-local`
 and the shell app of the engine, patch 0056) do not list every file, because iOS offers a language to the shell only when the
 app declares it. The key checks treat the `ios.*` keys as used (`catalogKeys` in `frontend/Tests/l10n-key-rules.json`).
@@ -362,6 +442,14 @@ lookup shows the English text, then the key, and one line goes to standard error
 ```bash
 swift test --package-path frontend
 ```
+
+To skip the multi-minute UI width and interaction-budget suites on routine local pushes, `pre-push` runs:
+
+```bash
+swift test --package-path frontend --skip 'LauncherControlWidthTests|LauncherPerformanceTests'
+```
+
+Run `swift test --package-path frontend --filter LauncherControlWidthTests` whenever a change touches UI layout, control sizing or localized button widths, and CI still runs the full `swift test` suite on every pull request.
 
 The Swift tests cover bundle validation, persistent metadata, folder discovery,
 source-file preservation, and automatic registration through a synthetic build

@@ -6,14 +6,8 @@ import XCTest
 /// The Controls page's layout and the DM_KEYMAP / DM_PAD_MAP it passes (read by dm/host/input_map.h).
 final class ControlsTests: IsolatedDefaultsTestCase {
     private var defaults: UserDefaults!
-    private let suite = "nxnative-controls-tests"
 
-    override func setUp() {
-        defaults = UserDefaults(suiteName: suite)
-        defaults.removePersistentDomain(forName: suite)
-    }
-
-    override func tearDown() { defaults.removePersistentDomain(forName: suite) }
+    override func setUp() { defaults = TestDefaults.make("nxnative-controls-tests") }
 
     private func fn(_ id: String) -> ControlLayout.Function { ControlLayout.functions.first { $0.id == id }! }
 
@@ -23,6 +17,21 @@ final class ControlsTests: IsolatedDefaultsTestCase {
         XCTAssertEqual(layout.environment, [:])
         XCTAssertEqual(layout.key(fn("A")), 38)
         XCTAssertNil(layout.key(fn("RUp")))
+    }
+
+    /// #901: the editor opens with a snapshot. Cancel puts it back, and Save keeps the edits.
+    func testASnapshotTellsEditsApartAndRestoreUndoesThemAlsoInTheSavedSettings() {
+        let layout = ControlLayout(defaults: defaults)
+        let opened = layout.snapshot
+        XCTAssertEqual(layout.snapshot, opened, "nothing changed: Cancel leaves without asking")
+        layout.assign(fn("A"), key: 40)
+        layout.setSends("A", "B")
+        XCTAssertNotEqual(layout.snapshot, opened, "edits: Cancel asks before discarding")
+        XCTAssertFalse(layout.environment.isEmpty)
+        layout.restore(opened)
+        XCTAssertEqual(layout.snapshot, opened)
+        XCTAssertEqual(layout.environment, [:])
+        XCTAssertEqual(ControlLayout(defaults: defaults).environment, [:], "the discarded edit is not kept for the next start")
     }
 
     func testAssigningAnotherFunctionsKeyLeavesThatFunctionOnNone() {
@@ -80,5 +89,34 @@ final class StageNameTests: IsolatedDefaultsTestCase {
         XCTAssertEqual(Stage.localizedName("Vulkan shader capture", zh), "Vulkan 着色器捕获")
         XCTAssertEqual(Stage.localizedName("a stage added later", zh), "a stage added later", "an unknown name stays as the script wrote it")
         XCTAssertEqual(Stage.localizedName("Mac app", { $0 }), "Mac app")
+        let de = { (k: String) in L10n.string(k, Lang("de")) }
+        XCTAssertEqual(Stage.localizedName("extract", de), "extract", "nxb 0.6.1 names the stage without a version: no \"%@ extrahieren\"")
+        XCTAssertEqual(Stage.localizedName("extract v0 + v327680", de), "v0 + v327680 extrahieren")
+    }
+
+    /// A Switch 2 game folder packs its versions (pack_dump.py), a NUP unpacks them (pack_nup.py): build_ipa_from_nsp.py's
+    /// stages "pack v458752", "pack DLC" and "unpack v196608" were shown in English in every language (#445).
+    func testTheGameFolderStagesAreShownInTheLaunchersLanguage() {
+        let de = { (k: String) in L10n.string(k, Lang("de")) }, zh = { (k: String) in L10n.string(k, .zh) }
+        XCTAssertEqual(Stage.localizedName("pack v458752", de), "v458752 packen")
+        XCTAssertEqual(Stage.localizedName("pack DLC", zh), "打包 DLC", "the DLC stage is its own row, not pack of \"DLC\"")
+        XCTAssertEqual(Stage.localizedName("unpack v196608", zh), "解包 v196608")
+        for lang in Lang.all {
+            for key in ["stage.pack", "stage.pack_dlc", "stage.unpack", "stage.check"] { XCTAssertNotEqual(L10n.string(key, lang), key, "\(key) in \(lang)") }
+        }
+    }
+
+    func testCheckFilesAndExistingStagesFollowTheCurrentLanguage() {
+        let japanese = { (key: String) in L10n.string(key, Lang("ja")) }
+        let chinese = { (key: String) in L10n.string(key, .zh) }
+        let check = Stage(id: 1, name: "check v655360 files")
+        XCTAssertEqual(check.displayName(japanese), "v655360 のファイルを確認")
+        XCTAssertEqual(check.displayName(chinese), "检查 v655360 文件")
+        let extract = Stage(id: 2, name: "extract v655360")
+        XCTAssertEqual(extract.displayName(japanese), "v655360 の抽出")
+        XCTAssertEqual(extract.displayName(chinese), "提取 v655360")
+        let install = Stage(id: 3, name: "Install on iPhone", nameKey: "dev.installStage", nameArgument: "iPhone")
+        XCTAssertEqual(install.displayName(japanese), String(format: japanese("dev.installStage"), "iPhone"))
+        XCTAssertEqual(install.displayName(chinese), String(format: chinese("dev.installStage"), "iPhone"))
     }
 }

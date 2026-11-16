@@ -19,48 +19,58 @@ from __future__ import annotations
 import concurrent.futures as cf
 import lzma
 import os
+import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import time
 import zlib
 from pathlib import Path
 from typing import Callable, Iterator
 
+from . import archive_guard as ag
 from . import toolchain as tc
 
 XIP_WANT = '/Platforms/iPhoneOS.platform/Developer/SDKs/'
+MAX_ZIP_MEMBERS = 65_536
+MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB ceiling for unpacked SDK archives
+_VALID_SDK_VER_RE = re.compile(r'^\d+(?:\.\d+)*$')
+_VALID_SDK_DIR_RE = re.compile(r'^iPhoneOS\d+(?:\.\d+)*\.sdk$')
 
 
 class SdkError(Exception):
     """A user-facing failure: the message says what to do next, not just what broke."""
 
 
+def _clean_archive_relpath(raw: str) -> str | None:
+    return ag.clean_archive_relpath(raw)
+
+
+def _is_within(child: Path, root: Path) -> bool:
+    return ag.is_within(child, root)
+
+
+def _is_same_or_within(child: Path, root: Path) -> bool:
+    return ag.is_same_or_within(child, root)
+
+
+def _win_path(p: Path | str) -> str:
+    return ag.win_path(p)
+
+
 def rmtree(path: Path) -> None:
-    """Remove a tree, clearing the read-only bits git leaves on Windows.
-
-    `shutil.rmtree` fails on a read-only file and `ignore_errors=True` then leaves the directory
-    half-removed. Git marks its pack files read-only, so the stale clone survived every cleanup
-    and the next `git clone` refused the non-empty destination. Retried once after chmodding the
-    survivors, and only then given up on.
-    """
-    import stat
-    if not path.exists():
-        return
-
-    def clear(func, p, _exc):                  # onerror: drop the read-only bit and retry
-        try:
-            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-            func(p)
-        except OSError:
-            pass
-
-    shutil.rmtree(path, onerror=clear)
-    if path.exists():                          # a file locked by another process (an indexer)
-        shutil.rmtree(path, ignore_errors=True)
+    ag.rmtree_force(path)
 
 
 # ---------------------------------------------------------------- git route
+
+def repair_tbd_stubs(sdk: Path, log: Callable[[str], None] | None = None, **kwargs) -> int:
+    """The toolchain's repair, re-exported for the clone route: fix `.tbd` text stubs in place."""
+    return tc.repair_tbd_stubs(sdk, log=log, **kwargs)
+
+
+
 
 def materialize_symlinks(repo: Path, sub: str, log: Callable[[str], None]) -> int:
     """Copy the targets of the SDK's git symlinks over their checked-out text stubs.
@@ -78,29 +88,81 @@ def materialize_symlinks(repo: Path, sub: str, log: Callable[[str], None]) -> in
     args = ['ls-files', '-s', '-z']
     if sub:
         args += ['--', sub]
+    git = str(tc.git_exe() or shutil.which('git') or 'git')
     try:
-        r = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, **tc.no_window())
+        r = subprocess.run([git, '-C', str(repo), *args], capture_output=True, **tc.no_window())
     except OSError:
         return 0
     if r.returncode:
         return 0
-    fixed = 0
+    symlinks: list[Path] = []
     for entry in r.stdout.split(b'\x00'):
         if not entry:
             continue
         meta, _, rel = entry.partition(b'\t')
         if meta.split(b' ')[0] != b'120000':
             continue
-        p = repo / os.fsdecode(rel)
-        if not p.is_file() or p.is_symlink():
-            continue
-        target = p.read_text(encoding='utf-8', errors='replace').strip()
-        real = (p.parent / target).resolve()
-        if not real.is_file():
-            log(f'    {rel.decode("utf-8", "replace")}: its target {target!r} is missing, left as it is')
-            continue
-        p.write_bytes(real.read_bytes())
-        fixed += 1
+        symlinks.append(repo / os.fsdecode(rel))
+    pending = set(symlinks)
+    fixed = 0
+    for _pass in range(4):
+        round_fixed = 0
+        for p in list(symlinks):
+            if p not in pending:
+                continue
+            wp = Path(_win_path(p))
+            if not wp.is_file() or wp.is_symlink():
+                pending.discard(p)
+                continue
+            try:
+                target = wp.read_text(encoding='utf-8', errors='replace').strip()
+            except OSError:
+                pending.discard(p)
+                continue
+            if not target or ':' in target or target.startswith(('/', '\\')):
+                pending.discard(p)
+                continue
+            cand = p.parent / target.replace('\\', '/')
+            if not _is_within(cand, repo):
+                pending.discard(p)
+                continue
+            if cand in pending:
+                continue  # target is itself a symlink stub; resolve it first
+            wreal = Path(_win_path(cand.resolve()))
+            try:
+                if wreal.is_dir():
+                    p_real = p.resolve()
+                    cand_real = cand.resolve()
+                    if (
+                        p_real == cand_real
+                        or p_real.is_relative_to(cand_real)
+                        or cand_real.is_relative_to(p_real)
+                    ):
+                        pending.discard(p)
+                        continue
+                    wp.unlink()
+                    shutil.copytree(str(wreal), str(wp), dirs_exist_ok=True)
+                    pending.discard(p)
+                    round_fixed += 1
+                    fixed += 1
+                elif wreal.is_file():
+                    wp.write_bytes(wreal.read_bytes())
+                    pending.discard(p)
+                    round_fixed += 1
+                    fixed += 1
+            except (OSError, shutil.Error) as e:
+                log(f'    {p.relative_to(repo).as_posix()}: copy warning ({e}), skipped')
+                pending.discard(p)
+        if not round_fixed:
+            break
+    for p in sorted(pending):
+        wp = Path(_win_path(p))
+        if wp.is_file() and not wp.is_symlink():
+            try:
+                target = wp.read_text(encoding='utf-8', errors='replace').strip()
+            except OSError:
+                target = ''
+            log(f'    {p.relative_to(repo).as_posix()}: its target {target!r} is missing, left as it is')
     if fixed:
         log(f'    materialized {fixed} symlink stubs into real files (Windows checkout of git symlinks)')
     return fixed
@@ -128,9 +190,15 @@ def clone_sdk(version: str = tc.SDK_PINNED, dest: Path | None = None,
     dest.mkdir(parents=True, exist_ok=True)
     target = dest / version
     if tc.is_sdk_dir(target):
+        # The cached SDK may predate the symlink materialization: repair it in place, then the
+        # probe links on the next run instead of failing on a 15-byte text file forever.
+        repair_tbd_stubs(target, log=log)
         log(f'SDK already present: {target}')
         return target
-    work = dest / f'.clone-{version}'
+    # Clean up any legacy `.clone-<version>` folder from an earlier interrupted run, then use a
+    # short `.tmp` directory name to keep deep SDK paths well under MAX_PATH.
+    rmtree(dest / f'.clone-{version}')
+    work = dest / '.tmp'
     rmtree(work)
 
     def run(args: list[str], what: str, repo: str = tc.SDK_REPO) -> None:
@@ -175,6 +243,16 @@ def clone_sdk(version: str = tc.SDK_PINNED, dest: Path | None = None,
         rmtree(work)
         try:
             run(clone_args + [repo, str(work)], 'clone', repo)
+            # narrow the working tree to the one SDK inside the mirror loop: `--filter=blob:none`
+            # defers all blob downloads to `sparse-checkout set`, so a connection that passes the
+            # tiny initial clone and drops during the multi-hundred-MB blob fetch must retry on
+            # the next mirror rather than aborting the whole install.
+            try:
+                subprocess.run([git, '-c', 'core.longpaths=true', 'sparse-checkout', 'set', version],
+                               cwd=str(work), check=True, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace', **tc.no_window())
+            except subprocess.CalledProcessError as e:
+                raise SdkError(f'git sparse-checkout failed: {(e.stderr or "").strip()[-400:]}') from e
             last = None
             break
         except SdkError as e:
@@ -182,31 +260,141 @@ def clone_sdk(version: str = tc.SDK_PINNED, dest: Path | None = None,
     if last is not None:
         rmtree(work)
         raise last
-    # narrow the working tree to the one SDK before checking anything out (same long-paths
-    # config: -c applies to one command only, so this call carries it too)
-    try:
-        subprocess.run([git, '-c', 'core.longpaths=true', 'sparse-checkout', 'set', version],
-                       cwd=str(work), check=True, capture_output=True, text=True,
-                       encoding='utf-8', errors='replace', **tc.no_window())
-    except subprocess.CalledProcessError as e:
-        raise SdkError(f'git sparse-checkout failed: {(e.stderr or "").strip()[-400:]}') from e
     src = work / version
-    if not tc.is_sdk_dir(src):
-        raise SdkError(f'{tc.SDK_REPO} has no usable {version}: pick another version, or use a .xip')
-    # The .git folder is deleted with `work` after the move, so this has to happen here, while
-    # the index can still tell symlinks from the text files a Windows checkout left behind.
-    materialize_symlinks(work, version, log=log)
-    if target.exists():
-        shutil.rmtree(target, ignore_errors=True)
-    shutil.move(str(src), str(target))
-    shutil.rmtree(work, ignore_errors=True)
+    try:
+        if not tc.is_sdk_dir(src):
+            raise SdkError(f'{tc.SDK_REPO} has no usable {version}: pick another version, or use a .xip')
+        # The .git folder is deleted with `work` after the move, so this has to happen here, while
+        # the index can still tell symlinks from the text files a Windows checkout left behind.
+        materialize_symlinks(work, version, log=log)
+        repair_tbd_stubs(src, log=log, error_cls=SdkError)
+        ag.install_staged_tree(src, target, validator=tc.is_sdk_dir, error_cls=SdkError)
+    finally:
+        rmtree(work)
     log(f'SDK ready: {target} ({tc.sdk_version(target)[0]})')
     return target
 
 
+def install_sdk_from_zip(zip_path: Path, dest: Path | None = None,
+                         log: Callable[[str], None] | None = None,
+                         unpack_progress: Callable[[int, int], None] | None = None) -> Path:
+    """Unpack an `iPhoneOS*.sdk.zip` archive (from `xybp888/iOS-SDKs` releases or user-supplied),
+    materialize Unix symlinks and `.tbd` text stubs, and return the SDK directory in `dest`.
+    """
+    import zipfile
+    log = log or (lambda s: None)
+    src_zip = Path(zip_path)
+    if not src_zip.is_file():
+        raise SdkError(f'no such file: {src_zip}')
+    dest = Path(dest or tc.sdk_cache_dir())
+    dest.mkdir(parents=True, exist_ok=True)
+    rmtree(dest / '.u')
+    for stale in dest.glob('.s-*'):
+        rmtree(stale)
+    staging = Path(tempfile.mkdtemp(prefix='.s-', dir=str(dest)))
+    log(f'unpacking {src_zip.name} → {dest}')
+    try:
+        quota = ag.ArchiveQuota(max_entries=MAX_ZIP_MEMBERS, max_bytes=MAX_ZIP_BYTES)
+        try:
+            ag.extract_zip_safely(
+                src_zip,
+                staging,
+                quota=quota,
+                unpack_progress=unpack_progress,
+                log=log,
+                error_cls=SdkError,
+            )
+        except zipfile.BadZipFile as e:
+            raise SdkError(f'{src_zip.name} is not a valid zip archive ({e})') from e
+        except OSError as e:
+            raise SdkError(f'failed to unpack {src_zip.name}: {e}') from e
+
+        sdk_src = tc.resolve_sdk_dir(staging)
+        if sdk_src is None or not _is_same_or_within(sdk_src, staging):
+            raise SdkError(
+                f'{src_zip.name} does not contain a valid iPhoneOS SDK '
+                '(needs SDKSettings.json and System/Library/Frameworks/UIKit.framework)'
+            )
+        repair_tbd_stubs(
+            sdk_src,
+            log=log,
+            quota=quota,
+            error_cls=SdkError,
+        )
+        ver, _ = tc.sdk_version(sdk_src)
+        if ver and not _VALID_SDK_VER_RE.match(ver):
+            raise SdkError(f'invalid SDK version in SDKSettings.json: {ver!r}')
+        if _VALID_SDK_DIR_RE.match(sdk_src.name) and (not ver or sdk_src.name == f'iPhoneOS{ver}.sdk'):
+            folder_name = sdk_src.name
+        elif ver:
+            folder_name = f'iPhoneOS{ver}.sdk'
+        else:
+            folder_name = tc.SDK_PINNED
+        if not _VALID_SDK_DIR_RE.match(folder_name):
+            raise SdkError(f'invalid SDK directory name: {folder_name!r}')
+        dest_real = Path(os.path.abspath(os.fspath(dest))).resolve()
+        target = dest / folder_name
+        target_real = Path(os.path.abspath(os.fspath(target))).resolve()
+        if target_real.parent != dest_real:
+            raise SdkError(f'target SDK path escapes destination directory: {target}')
+
+        ag.install_staged_tree(
+            sdk_src,
+            target,
+            validator=tc.is_sdk_dir,
+            error_cls=SdkError,
+        )
+        log(f'SDK ready: {target} ({tc.sdk_version(target)[0]})')
+        return target
+    finally:
+        rmtree(staging)
+
+
+def install_sdk(version: str = tc.SDK_PINNED, dest: Path | None = None,
+                log: Callable[[str], None] | None = None,
+                progress: Callable[[int, int], None] | None = None,
+                unpack_progress: Callable[[int, int], None] | None = None,
+                fallback_git: bool = True) -> Path:
+    """Download and install the pinned iPhoneOS SDK via the release `.zip` (using GitHub mirrors
+    and speed ranking, no git required), falling back to `clone_sdk` if needed."""
+    log = log or (lambda s: None)
+    dest = Path(dest or tc.sdk_cache_dir())
+    dest.mkdir(parents=True, exist_ok=True)
+    target = dest / version
+    if tc.is_sdk_dir(target):
+        repair_tbd_stubs(target, log=log)
+        log(f'SDK already present: {target}')
+        return target
+    if version == tc.SDK_PINNED and tc.SDK_ASSET.get('url'):
+        from . import fetch as wf
+        asset = tc.SDK_ASSET
+        cache = tc.tools_dir() / 'downloads'
+        try:
+            zpath = wf.download(
+                asset['url'],
+                cache / asset['name'],
+                asset['sha256'],
+                asset.get('size'),
+                log=log,
+                progress=progress,
+            )
+            return install_sdk_from_zip(zpath, dest=dest, log=log, unpack_progress=unpack_progress)
+        except (wf.DownloadError, SdkError) as e:
+            if not fallback_git:
+                raise
+            log(f'release archive download did not succeed ({e}); trying git sparse-checkout fallback…')
+            if not (tc.git_exe() or shutil.which('git')):
+                try:
+                    wf.install_git(log=log, progress=progress)
+                except wf.DownloadError:
+                    raise SdkError(str(e)) from e
+    return clone_sdk(version=version, dest=dest, log=log)
+
+
 def available_versions(log: Callable[[str], None] | None = None) -> list[str]:
     """The SDK versions the repository currently offers (needs network; best effort)."""
-    git = shutil.which('git')
+    found = tc.git_exe() or shutil.which('git')
+    git = str(found) if found else None
     if not git:
         return []
     try:
@@ -234,16 +422,36 @@ def import_local(src: Path, dest: Path | None = None,
                            'System/Library/Frameworks/UIKit.framework)')
         cand = inner[0]
     dest = Path(dest or tc.sdk_cache_dir())
-    target = dest / cand.name
+    dest.mkdir(parents=True, exist_ok=True)
+    ver, _ = tc.sdk_version(cand)
+    if ver and not _VALID_SDK_VER_RE.match(ver):
+        raise SdkError(f'invalid SDK version in SDKSettings.json: {ver!r}')
+    folder_name = cand.name if _VALID_SDK_DIR_RE.match(cand.name) else (f'iPhoneOS{ver}.sdk' if ver else tc.SDK_PINNED)
+    if not _VALID_SDK_DIR_RE.match(folder_name):
+        raise SdkError(f'invalid SDK directory name: {folder_name!r}')
+    target = dest / folder_name
     if cand.resolve() == target.resolve():
         log(f'SDK is already in place: {target}')
         return target
-    dest.mkdir(parents=True, exist_ok=True)
     log(f'copying {cand} → {target} (several GB, a few minutes)')
-    shutil.rmtree(target, ignore_errors=True)
-    shutil.copytree(cand, target, symlinks=False, dirs_exist_ok=True)
-    if not tc.is_sdk_dir(target):
-        raise SdkError(f'the copy at {target} is not a usable SDK (the source may be incomplete)')
+    for stale in dest.glob('.imp-*'):
+        rmtree(stale)
+    staging = Path(tempfile.mkdtemp(prefix='.imp-', dir=str(dest)))
+    staged_sdk = staging / folder_name
+    try:
+        try:
+            shutil.copytree(_win_path(cand), _win_path(staged_sdk), symlinks=False, dirs_exist_ok=True)
+        except (OSError, shutil.Error) as e:
+            raise SdkError(f'failed to copy SDK from {cand}: {e}') from e
+        repair_tbd_stubs(staged_sdk, log=log, error_cls=SdkError)
+        ag.install_staged_tree(
+            staged_sdk,
+            target,
+            validator=tc.is_sdk_dir,
+            error_cls=SdkError,
+        )
+    finally:
+        rmtree(staging)
     log(f'SDK ready: {target} ({tc.sdk_version(target)[0]})')
     return target
 
@@ -292,11 +500,16 @@ def _settle_sdk_dir(out: Path, produced: Path | None, log: Callable[[str], None]
     """Make sure a `iPhoneOS*.sdk` sits directly in the cache with the right name."""
     if produced and produced.is_dir():
         ver, _ = tc.sdk_version(produced)
+        if ver and not _VALID_SDK_VER_RE.match(ver):
+            raise SdkError(f'invalid SDK version in SDKSettings.json: {ver!r}')
         want = out / f'iPhoneOS{ver}.sdk' if ver else produced
         if produced != want:
-            if want.exists():
-                shutil.rmtree(want, ignore_errors=True)
-            shutil.move(str(produced), str(want))
+            ag.install_staged_tree(
+                produced,
+                want,
+                validator=tc.is_sdk_dir,
+                error_cls=SdkError,
+            )
         return want
     for p in sorted((x for x in out.glob('iPhoneOS*.sdk') if x.is_dir()), reverse=True):
         if tc.is_sdk_dir(p):
@@ -523,36 +736,32 @@ def _extract(f, start: int, length: int, out: Path, need: dict,
     return None
 
 
-def _materialize(out: Path, links: list[tuple[str, str]], log: Callable[[str], None]) -> None:
-    """Write each symlink as a copy of its target (Windows symlinks need extra privileges).
-
-    Links are resolved through other links (`Headers → Versions/Current/Headers`, where
-    `Versions/Current` is itself a link), so this loops until nothing new resolves.
-    """
-    todo = [(rel, t) for rel, t in links if '/' in rel.rstrip('/')]
-    while True:
-        left = []
-        for rel, target in todo:
-            dst = out / rel
-            src = None if target.startswith('/') else (dst.parent / target)
-            if src is None:
-                log(f'  link {rel} → {target}: absolute, skipped')
-                continue
-            if dst.exists():
-                continue
-            if not src.exists():
-                left.append((rel, target))
-                continue
-            if src.is_dir():
-                shutil.copytree(src, dst)
-            else:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(src, dst)
-        if len(left) == len(todo):
-            for rel, target in left:
-                log(f'  link {rel} → {target}: target not in the SDK, skipped')
-            return
-        todo = left
+def _materialize(
+    out: Path,
+    links: list[tuple[str, str]],
+    log: Callable[[str], None],
+    *,
+    strict: bool = False,
+    max_bytes: int | None = None,
+    bytes_used: int = 0,
+    max_entries: int | None = None,
+    entries_used: int = 0,
+) -> tuple[int, int]:
+    quota = ag.ArchiveQuota(
+        max_entries=max_entries if max_entries is not None else 10**12,
+        max_bytes=max_bytes if max_bytes is not None else 10**18,
+        entries_used=entries_used,
+        bytes_used=bytes_used,
+    )
+    ag.materialize_unix_symlinks(
+        out,
+        links,
+        quota=quota,
+        log=log,
+        strict=strict,
+        error_cls=SdkError,
+    )
+    return quota.entries_used, quota.bytes_used
 
 
 def _remaining_canaries(out: Path) -> list[Path]:

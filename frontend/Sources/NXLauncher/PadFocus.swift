@@ -23,7 +23,7 @@ package final class PadFocus: ObservableObject {
     @Published package private(set) var visible = false
     /// The scope the controller acts in: "main", or the open sheet's.
     package var scope = "main" { didSet { if scope != oldValue { focused = nil } } }
-    private var frames: [String: [Target]] = [:]
+    private(set) var frames: [String: [Target]] = [:]
     private var handlers: [String: Handlers] = [:]   // refreshed on every render of the target, so the closures see current state
 
     package func setFrames(_ targets: [Target], scope: String) { frames[scope] = targets }
@@ -115,7 +115,7 @@ private struct PadTargetModifier: ViewModifier {
         focus.register(id, handlers)
         let on = focus.visible && focus.focused == id
         return content
-            .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(LauncherPalette.cream, lineWidth: on ? 2 : 0).padding(ringStyle == .hug ? 0 : -4).allowsHitTesting(false))
+            .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(LauncherPalette.focusRing, lineWidth: on ? LauncherPalette.focusRingWidth : 0).padding(ringStyle == .hug ? 0 : -4).allowsHitTesting(false))
             .background(GeometryReader { g in
                 Color.clear.preference(key: PadTargetKey.self, value: [.init(id: id, frame: g.frame(in: .named("pad." + scope)))])
             })

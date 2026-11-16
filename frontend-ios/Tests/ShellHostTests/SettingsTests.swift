@@ -96,4 +96,48 @@ import ShellUI
         #expect(sections[1].rows[2].kind == .range(min: 0.5, max: 1.5, step: 0.05, unit: "×"))
         #expect(sections[1].rows[2].value == "1.0")
     }
+
+    /// #453: a row whose value differs from the tested default is marked, a value from the shell's settings is not (it has its own mark).
+    @Test func rowsThatDifferFromTheTestedDefaultAreMarked() throws {
+        let p = try profile()
+        var values = GameSettingsStore(profile: p, defaults: try Sandbox().defaults("x")).values()
+        #expect(SettingsPresenter.sections(profile: p, values: values).flatMap(\.rows).allSatisfy { !$0.changed })
+        values["DM_SHOW_FPS"] = "1"
+        values["DM_RENDER_SCALE"] = "1.00"   // a slider's 1.00 is the default 1.0
+        values["DM_OPMODE"] = "0"
+        let rows = SettingsPresenter.sections(profile: p, values: values, fromShell: ["DM_OPMODE"]).flatMap(\.rows)
+        #expect(rows.filter(\.changed).map(\.id) == ["DM_SHOW_FPS"])
+    }
+
+    /// #544: the HDR texture downsample only changes the CPU decode of BC textures, so a device that samples them itself does not see the row.
+    @Test func theHDRTextureRowIsOnlyOnDevicesWithoutBCSupport() throws {
+        let json = #"{"schema":1,"game":"0100F2C0115B6000","settings":[{"env":"DM_BC6H_RGB9E5","kind":"toggle","label":"Downsample HDR textures","note":"Saves memory","default":"0","section":"Performance"},{"env":"DM_SHOW_FPS","kind":"toggle","label":"FPS","note":"","default":"0","section":"Performance"}]}"#
+        let p = try LauncherProfile.parse(Data(json.utf8))
+        let without = SettingsPresenter.sections(profile: p, values: [:], capabilities: DeviceCapabilities(supportsBCTextureCompression: false))
+        #expect(without[0].rows.map(\.id) == ["DM_BC6H_RGB9E5", "DM_SHOW_FPS"])
+        let with = SettingsPresenter.sections(profile: p, values: [:], capabilities: DeviceCapabilities(supportsBCTextureCompression: true))
+        #expect(with[0].rows.map(\.id) == ["DM_SHOW_FPS"])
+        #expect(without[0].rows[0].value == "0", "the tested default stays off")
+    }
+
+    @MainActor @Test func romfsLanguagesSupplyTheGameLanguageRowWhenLauncherJSONHasNone() throws {
+        let box = try Sandbox()
+        let gameData = try box.giveAppData(Fixtures.orbit)
+        try box.write("JPja USen CNzh TWzh\n0111\n", to: gameData.appendingPathComponent("romfs/System/RegionLangMask.txt"))
+
+        let model = ShellHostModel(config: box.config())
+        let detail = try #require(model.details.first { $0.id == Fixtures.orbit })
+        let gameSection = try #require(detail.sections.first { $0.id == "Game" })
+        let langRow = try #require(gameSection.rows.first { $0.id == "DM_LANG" })
+        #expect(langRow.value == "en-US")
+        if case .choice(let opts) = langRow.kind {
+            #expect(opts.map(\.id) == ["en-US", "ja", "zh-Hant", "zh-Hans"])
+        } else {
+            Issue.record("expected DM_LANG to be a choice row")
+        }
+
+        model.change(Fixtures.orbit, setting: "DM_LANG", value: "zh-Hans")
+        let updated = try #require(model.details.first { $0.id == Fixtures.orbit })
+        #expect(updated.sections.first { $0.id == "Game" }?.rows.first { $0.id == "DM_LANG" }?.value == "zh-Hans")
+    }
 }

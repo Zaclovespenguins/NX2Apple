@@ -13,7 +13,8 @@ extension BuildStore {
             var d: ObjCBool = false
             return FileManager.default.fileExists(atPath: p, isDirectory: &d) && d.boolValue
         }
-        if paths.count == 1, isFolder(paths[0]) { scan(folder: paths[0]); return }
+        if paths.count == 1, isFolder(paths[0]) || GameFolder.isCandidate(paths[0]) { scan(folder: paths[0]); return }   // a folder, or one .nup file
+        leaveGameFolder()   // packages dropped after a game folder start over: the two never mix
         var found = GameInputs.classify(paths.flatMap { isFolder($0) ? GameInputs.inputFiles(in: $0) : [$0] })
         // update and add-on files of another game than the base (the dropped one, else the one already chosen)
         let baseName = (found.base ?? (basePath.isEmpty ? nil : basePath)).map { ($0 as NSString).lastPathComponent }
@@ -30,6 +31,8 @@ extension BuildStore {
         for (kind, text) in rejected { updateSlot(kind == .update ? "update" : "dlc") { $0.problem = text } }
         if found.update != nil { updateSlot("update") { $0.note = updateNote(found) } }
         if let base = found.base { gameDir = (base as NSString).deletingLastPathComponent }
+        // A keys file dropped itself is a choice and is kept for every game (#996). One found inside a dropped folder is not.
+        if let keys = found.keys, paths.contains(keys) { saveKeys(keys) }
     }
 
     /// The slots after a drop of `found`. Nothing usable in it leaves the slots as they were, but says so on an empty base row.

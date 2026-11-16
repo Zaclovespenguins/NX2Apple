@@ -1,3 +1,4 @@
+import NXCore
 import Foundation
 
 /// A Mac game's launch options as seedds/nxnative keeps them (docs/frontends.md, "Saved choices"): one string per setting under
@@ -9,7 +10,7 @@ import Foundation
 /// - Every row of the app's launcher.json is a saved choice.
 /// - A setting this launcher adds that launcher.json has no row for (Display mode, DM_FULLSCREEN, today) is not: launcher.c would
 ///   ignore a key it has no rule for. It stays in the library file and goes into the environment at Play, like the mods'
-///   DM_ROMFS_OVERLAY and the Controls page's DM_KEYMAP / DM_PAD_MAP (those become saved choices when seedds/nxnative#386 merges).
+///   DM_ROMFS_OVERLAY. Controller maps use their own capability marker and shared preferences schema.
 /// - A launch override (anything in the environment at Play) is temporary and is never written here.
 struct SavedChoices {
     let domain: String
@@ -41,21 +42,26 @@ struct SavedChoices {
     /// What the setting is set to: the saved choice, else the tested default.
     func current(_ s: LaunchSetting) -> String { value(s) ?? s.def }
 
-    /// A choice equal to the tested default removes the key, so the setting follows a later build's defaults.
+    /// A choice equal to the tested default removes the key, so the setting follows a later build's defaults. The game language
+    /// row of a game built in English keeps every choice (`packedDefault`): a missing key would get the Mac's language later.
     func set(_ s: LaunchSetting, _ v: String) {
-        if s.isDefault(v) || !s.accepts(v) { CFPreferencesSetAppValue(Self.key(s.env) as CFString, nil, domain as CFString) }
+        if !s.accepts(v) || (s.isDefault(v) && s.packedDefault == nil) { CFPreferencesSetAppValue(Self.key(s.env) as CFString, nil, domain as CFString) }
         else { CFPreferencesSetAppValue(Self.key(s.env) as CFString, v as CFString, domain as CFString) }
         CFPreferencesAppSynchronize(domain as CFString)
     }
 
-    /// "Reset to tested defaults": the keys of the settings the player can change.
+    /// "Reset to tested defaults": the keys of the settings the player can change. The game language goes back to the Mac's,
+    /// written at once so a start from Finder speaks it too.
     func reset(_ settings: [LaunchSetting]) {
         for s in settings where s.storeBacked { CFPreferencesSetAppValue(Self.key(s.env) as CFString, nil, domain as CFString) }
+        for s in settings where s.storeBacked { if let code = s.macLanguage { CFPreferencesSetAppValue(Self.key(s.env) as CFString, code as CFString, domain as CFString) } }
         CFPreferencesAppSynchronize(domain as CFString)
     }
 
-    /// Whether any setting has a saved choice (the Reset button shows).
-    func hasChoices(_ settings: [LaunchSetting]) -> Bool { settings.contains { $0.storeBacked && raw($0.env) != nil } }
+    /// Whether any setting has a saved choice (the Reset button shows). The Mac's language is the game language's default, not a choice.
+    func hasChoices(_ settings: [LaunchSetting]) -> Bool {
+        settings.contains { $0.storeBacked && raw($0.env) != nil && ($0.macLanguage == nil || raw($0.env) as? String != $0.macLanguage) }
+    }
 
     /// The one-time move of the options an earlier launcher kept in the library file: a valid choice that differs from the default
     /// goes to the domain where it has no value yet. Returns the variables that are the store's now (to drop from the library).
@@ -68,6 +74,51 @@ struct SavedChoices {
             if raw(s.env) == nil, s.accepts(v), !s.isDefault(v) { set(s, v) }
         }
         return moved
+    }
+
+    /// The language to preselect for the game language row (a choice row from launcher.json): the first of the Mac's preferred
+    /// languages the game has. Only for a game built in English, the script's own default: a build that asked for another
+    /// language (LANGUAGE / --language) keeps it.
+    static func macLanguage(_ s: LaunchSetting, preferred: [String] = Locale.preferredLanguages) -> String? {
+        guard s.env == "DM_LANG", s.kind == "choice", builtInEnglish(s), let options = s.options else { return nil }
+        return gameLanguage(preferred: preferred, offered: options.compactMap(\.first))
+    }
+
+    /// Whether a launcher.json row's packed default is English, the script's own default language.
+    static func builtInEnglish(_ s: LaunchSetting) -> Bool { (s.packedDefault ?? s.def).hasPrefix("en-") }
+
+    /// Writes the Mac's language to launcher.DM_LANG for a game whose language was never picked, so a start from Finder or the
+    /// Dock speaks it too. Once written it is a choice like any other: a later change of the Mac's language does not touch it.
+    /// Runs with the launch options migration (startup, Play, the Launch options sheet).
+    func preselectLanguage(_ settings: [LaunchSetting], preferred: [String] = Locale.preferredLanguages) {
+        guard let s = settings.first(where: { $0.env == "DM_LANG" && $0.storeBacked }), raw(s.env) == nil,
+              let code = Self.macLanguage(s, preferred: preferred) else { return }
+        CFPreferencesSetAppValue(Self.key(s.env) as CFString, code as CFString, domain as CFString)
+        CFPreferencesAppSynchronize(domain as CFString)
+    }
+
+    /// The game language (a code of dm/tools/nacp.py) for the first of `preferred` (BCP 47 tags, as Locale.preferredLanguages
+    /// gives them) the game offers: the same region's variant first, then the language's other one (en-GB before en-US for a
+    /// British Mac, es-419 for Spanish outside Spain, zh-Hant for Taiwan, Hong Kong and Macao). nil when it offers none of them.
+    static func gameLanguage(preferred: [String], offered: [String]) -> String? {
+        for tag in preferred {
+            let parts = tag.split(separator: "-").map(String.init)
+            guard let language = parts.first?.lowercased() else { continue }
+            let rest = Set(parts.dropFirst().map { $0.uppercased() })
+            let candidates: [String]
+            switch language {
+            case "en": candidates = rest.isDisjoint(with: ["GB", "IE", "AU", "NZ", "ZA", "IN", "001", "150"]) ? ["en-US", "en-GB"] : ["en-GB", "en-US"]
+            case "fr": candidates = rest.contains("CA") ? ["fr-CA", "fr"] : ["fr", "fr-CA"]
+            case "es": candidates = rest.isEmpty || rest.contains("ES") ? ["es", "es-419"] : ["es-419", "es"]
+            case "pt": candidates = rest.contains("BR") ? ["pt-BR", "pt"] : ["pt", "pt-BR"]
+            case "zh":   // the script decides; the region only without one (zh-HK is Traditional, zh-Hans-HK Simplified)
+                let traditional = rest.contains("HANT") || (!rest.contains("HANS") && !rest.isDisjoint(with: ["TW", "HK", "MO"]))
+                candidates = traditional ? ["zh-Hant"] : ["zh-Hans"]
+            default: candidates = [language]
+            }
+            if let match = candidates.first(where: offered.contains) { return match }
+        }
+        return nil
     }
 }
 
@@ -138,16 +189,49 @@ extension LibraryGame {
     /// this launcher always did. The rest is the Controls page's layout, what only this launcher has (Display mode), the mods, and
     /// DM_LAUNCHER=0 (this launcher is the settings window, so the app's own is skipped; saved choices still apply).
     func startEnvironment(controls: [String: String], settings: [LaunchSetting], mods: [GameMod],
-                          store: SavedChoices? = nil, appReadsStore: Bool = true) -> [String: String] {
-        var environment = controls
+                          store: SavedChoices? = nil, appReadsStore: Bool = true,
+                          controllerStore: ControllerPreferences? = nil, savingEnabled: Bool = true) -> [String: String] {
+        var environment = controllerStore?.launchControls(controls, savingEnabled: savingEnabled) ?? controls
         if !appReadsStore, let store {
             for s in settings where s.storeBacked {
-                if let v = store.value(s), !s.isDefault(v) { environment[s.env] = v }
+                // Compared with the packed default: the game language row's own may be the Mac's language, which the app lacks
+                if let v = store.value(s), !(s.packedDefault.map { $0 == v } ?? s.isDefault(v)) { environment[s.env] = v }
             }
         }
         environment.merge(launchEnvironment(settings)) { _, own in own }
+        environment.merge(controllerLaunchOverrides) { _, own in own }
         environment.merge(modEnvironment(mods)) { _, mods in mods }
         environment["DM_LAUNCHER"] = "0"
         return environment
+    }
+}
+
+
+extension SavedChoices {
+    static func appReadsControllerMappings(app: String) -> Bool {
+        let plist = URL(fileURLWithPath: app).appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plist),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let marker = info["DMControllerMappings"] as? NSNumber else { return false }
+        return marker.doubleValue == 1
+    }
+}
+
+extension LibraryGame {
+    var controllerLaunchOverrides: [String: String] {
+        launchOptions.filter { ["DM_KEYMAP", "DM_PAD_MAP", "DM_PAD_MERGE", "DM_SAVED_CHOICES"].contains($0.key) }
+    }
+    func controllerPreferences() -> ControllerPreferences {
+        ControllerPreferences(storage: SystemControllerPreferences(domain: SavedChoices.domain(app: appPath, titleID: titleID)))
+    }
+    func controllerSavingEnabled(environment: [String: String], support: URL? = nil) -> Bool {
+        let support = support ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let infoURL = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Info.plist")
+        let info = (try? Data(contentsOf: infoURL)).flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
+        let packedTitleID = (info?["DMTitleID"] as? String).flatMap { $0.isEmpty || $0.contains("/") ? nil : $0 } ?? titleID
+        let player = support.appendingPathComponent("nxnative").appendingPathComponent(packedTitleID).appendingPathComponent("env.txt")
+        let app = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Resources/dm/env.txt")
+        return ControllerMap.savingEnabled(environment: environment,
+            playerEnv: try? String(contentsOf: player, encoding: .utf8), appEnv: try? String(contentsOf: app, encoding: .utf8))
     }
 }

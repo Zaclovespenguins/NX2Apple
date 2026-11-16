@@ -26,6 +26,18 @@ import Testing
         }
     }
 
+    @Test func frameworkBuildEnvironmentReachesTheHostAndDocumentsCanOverrideIt() throws {
+        let rig = try Rig()
+        try rig.box.write("DM_PROF_TEX_BC_CPU=1\n", to: rig.fw.appendingPathComponent("dm/env.txt"))
+        #expect(rig.plan().environment["DM_PROF_TEX_BC_CPU"] == "1")
+        #expect(rig.plan().environment["DM_ENV_FILE_KEYS"] == "DM_PROF_TEX_BC_CPU")
+        #expect(rig.plan(envFile: "DM_PROF_TEX_BC_CPU=0\n").environment["DM_PROF_TEX_BC_CPU"] == "0")
+        try rig.box.write("DM_PROF_TEX_BC_CPU=0\n", to: rig.gdir.appendingPathComponent("env.txt"))
+        #expect(rig.plan().environment["DM_PROF_TEX_BC_CPU"] == "0")
+        let another = try Rig()
+        #expect(another.plan().environment["DM_PROF_TEX_BC_CPU"] == nil)
+    }
+
     @Test func defaultsPointIntoTheFramework() throws {
         let rig = try Rig()
         let env = rig.plan().environment
@@ -56,6 +68,38 @@ import Testing
         let rig = try Rig()
         try rig.box.makeFolder(rig.fw.appendingPathComponent("pso"))
         #expect(rig.plan().environment["DM_PSO_BUNDLE"] == rig.fw.path + "/pso")
+    }
+
+    @Test(arguments: [false, true]) func sharedEnvCanDisableADiscoveredPipelineArchive(perGameArchive: Bool) throws {
+        let rig = try Rig()
+        try rig.box.makeFolder(rig.fw.appendingPathComponent("pso"))
+        if perGameArchive { try rig.box.makeFolder(rig.gdir.appendingPathComponent("pso")) }
+        let env = rig.plan(envFile: "DM_PSO_BUNDLE=off\n").environment
+        #expect(env["DM_PSO_BUNDLE"] == "off")
+        #expect(env["DM_ENV_FILE_KEYS"] == "DM_PSO_BUNDLE")
+    }
+
+    @Test func gameArchiveOverrideWinsOverSharedFileAndStaysWithItsGame() throws {
+        let rig = try Rig()
+        try rig.box.makeFolder(rig.fw.appendingPathComponent("pso"))
+        try rig.box.write("DM_PSO_BUNDLE=off\n", to: rig.gdir.appendingPathComponent("env.txt"))
+        let env = rig.plan(envFile: "DM_PSO_BUNDLE=/shared/archive\n").environment
+        #expect(env["DM_PSO_BUNDLE"] == "off")
+        #expect(env["DM_ENV_FILE_KEYS"] == "DM_PSO_BUNDLE")
+        var other = rig.game
+        other.appFolder = rig.box.documents.appendingPathComponent("games/0100000000000000")
+        let otherPlan = EngineLaunchPlan.make(game: other, appResources: rig.box.resources, documents: rig.box.documents, envFileText: nil)
+        #expect(otherPlan.environment["DM_PSO_BUNDLE"] == rig.fw.path + "/pso")
+        #expect(otherPlan.environment["DM_ENV_FILE_KEYS"] == "")
+    }
+
+    @Test func explicitLaunchArchiveWinsOverEnvFilesAndDiscoveredArchives() throws {
+        let rig = try Rig(environment: ["DM_PSO_BUNDLE": "/launch/archive"])
+        try rig.box.makeFolder(rig.fw.appendingPathComponent("pso"))
+        try rig.box.write("DM_PSO_BUNDLE=off\n", to: rig.gdir.appendingPathComponent("env.txt"))
+        let env = rig.plan(envFile: "DM_PSO_BUNDLE=/shared/archive\n").environment
+        #expect(env["DM_PSO_BUNDLE"] == "/launch/archive")
+        #expect(env["DM_ENV_FILE_KEYS"] == "")
     }
 
     @Test func romfsImageIsMatchedCaseInsensitively() throws {
@@ -211,5 +255,37 @@ import Testing
         for url in plan.foldersToCreate { #expect(FileManager.default.fileExists(atPath: url.path)) }
         #expect(!FileManager.default.fileExists(atPath: rig.gdir.path + "/cheats"))
         try plan.createFolders()
+    }
+
+    @Test func audioMixPrecedenceIsGameThenShellThenBuiltIn() throws {
+        // Built-in default is off (DM_AUDIO_MIX unset) when neither game nor shell sets it.
+        let builtIn = try Rig()
+        #expect(builtIn.plan().environment["DM_AUDIO_MIX"] == nil)
+
+        // Shell default turns DM_AUDIO_MIX on when the game leaves it unset, and beats shared env.txt.
+        var shellOnly = try Rig()
+        shellOnly.game.shellEnvironment = ["DM_AUDIO_MIX": "1"]
+        #expect(shellOnly.plan().environment["DM_AUDIO_MIX"] == "1")
+        #expect(shellOnly.plan(envFile: "DM_AUDIO_MIX=0\n").environment["DM_AUDIO_MIX"] == "1")
+
+        // Game env.txt "0" overrides shell "1" via both shellEnvironment and shellFallbackKeys.
+        try shellOnly.box.write("DM_AUDIO_MIX=0\n", to: shellOnly.gdir.appendingPathComponent("env.txt"))
+        #expect(shellOnly.plan().environment["DM_AUDIO_MIX"] == "0")
+
+        var fallbackGame = try Rig(environment: ["DM_AUDIO_MIX": "1"])
+        fallbackGame.game.shellFallbackKeys = ["DM_AUDIO_MIX"]
+        try fallbackGame.box.write("DM_AUDIO_MIX=0\n", to: fallbackGame.gdir.appendingPathComponent("env.txt"))
+        #expect(fallbackGame.plan().environment["DM_AUDIO_MIX"] == "0")
+
+        // Game env.txt "1" overrides shell off.
+        let gameOn = try Rig()
+        try gameOn.box.write("DM_AUDIO_MIX=1\n", to: gameOn.gdir.appendingPathComponent("env.txt"))
+        #expect(gameOn.plan().environment["DM_AUDIO_MIX"] == "1")
+
+        // Explicit per-game choice in game.environment wins over game env.txt and shell default.
+        var explicitGame = try Rig(environment: ["DM_AUDIO_MIX": "0"])
+        explicitGame.game.shellEnvironment = ["DM_AUDIO_MIX": "1"]
+        try explicitGame.box.write("DM_AUDIO_MIX=1\n", to: explicitGame.gdir.appendingPathComponent("env.txt"))
+        #expect(explicitGame.plan().environment["DM_AUDIO_MIX"] == "0")
     }
 }

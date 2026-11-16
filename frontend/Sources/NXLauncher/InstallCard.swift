@@ -9,14 +9,18 @@ package struct InstallCard: View {
     @ObservedObject var devices: DeviceStore
     @ObservedObject var build: BuildStore
     @EnvironmentObject var loc: Localizer
+    @State private var selectDeviceGamesOpen = false
 
-    package init(devices: DeviceStore, build: BuildStore) {
+    let showLocked: Bool
+
+    package init(devices: DeviceStore, build: BuildStore, showLocked: Bool = true) {
+        self.showLocked = showLocked
         self.devices = devices
         self.build = build
     }
 
     package var body: some View {
-        if build.target != BuildTarget.mac { card.disabled(build.running && !sending) }
+        if build.target != BuildTarget.mac, !build.running || sending || showLocked { card.disabled(build.running && !sending) }
     }
 
     /// The copy of the game data runs on the build store's `running` flag too, and its own buttons must stay usable (Stop).
@@ -64,9 +68,36 @@ package struct InstallCard: View {
                         }
                     }
                 }
+                let builtCount = build.builtShellGames().count
+                if builtCount > 0 {
+                    CardDivider()
+                    CardRow(loc.t("shell.builtTitle"), detail: loc.t("shell.installBuiltNote")) {
+                        Button(String(format: loc.t("shell.installBuilt"), builtCount)) { build.installBuiltGames() }
+                            .buttonStyle(LauncherSecondaryButtonStyle())
+                            .disabled(build.running || !build.installsDirectly || devices.exportIPA)
+                            .help(loc.t("shell.installBuiltNote"))
+                    }
+                    if !build.sharedAppDataSources().isEmpty {
+                        CardDivider()
+                        CardRow(loc.t("shell.step3Title"), detail: loc.t("shell.sendAllNote")) {
+                            Button(loc.t("shell.selectGamesButton")) { selectDeviceGamesOpen = true }
+                                .buttonStyle(LauncherSecondaryButtonStyle())
+                                .disabled(!build.canSendAllGameData)
+                                .help(loc.t("shell.selectGamesDeviceNote"))
+                            Button(loc.t("shell.sendAllButton")) { build.sendAllGameData() }
+                                .buttonStyle(LauncherSecondaryButtonStyle())
+                                .disabled(!build.canSendAllGameData)
+                                .help(loc.t("shell.sendAllNote"))
+                        }
+                    }
+                }
             }
         }
         .onAppear { if !devices.checked { _ = devices.refresh() } }
+        .sheet(isPresented: $selectDeviceGamesOpen) {
+            SendSelectedSheet(mode: .device, build: build) { selectDeviceGamesOpen = false }
+                .environmentObject(loc)
+        }
     }
 
     /// The other kind of IPA: the IPA of the last export is not the one this choice makes, so step 1 starts again.

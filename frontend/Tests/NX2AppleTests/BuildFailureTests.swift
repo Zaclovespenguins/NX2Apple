@@ -35,7 +35,7 @@ import NXModel
     }
 
     func testEveryKindIsReachable() {
-        let kinds = Set(BuildFailureClassifier.table.map(\.kind))
+        let kinds = Set((BuildFailureClassifier.table + BuildFailureClassifier.extraTable).map(\.kind))
         for k in BuildFailureKind.allCases where k != .unknown && !Self.stateKinds.contains(k) { XCTAssertTrue(kinds.contains(k), "\(k)") }
     }
 
@@ -49,6 +49,10 @@ import NXModel
                 XCTAssertEqual(String(cString: strerror(ENOSPC)), f.fragment, f.id)
                 continue
             }
+            if f.source == "errno45" {   // the system's text for ENOTSUP, which renamex_np answers on a volume without RENAME_SWAP (pack_app.py replace_app)
+                XCTAssertEqual(String(cString: strerror(ENOTSUP)), f.fragment, f.id)
+                continue
+            }
             if f.source == "codesign" { continue }   // Apple's text, from a tool the script runs
             let source = try String(contentsOf: Self.engine.appendingPathComponent(f.source), encoding: .utf8)
             let there = source.contains(f.fragment)
@@ -56,9 +60,32 @@ import NXModel
         }
     }
 
+    /// #553: a profile kept from an earlier build that lacks the selected update stops the build and names the folder it kept.
+    func testAStaleProvisionalProfileIsItsOwnStopWithItsFolder() throws {
+        let f = try XCTUnwrap(fixtures().first { $0.id == "profile.stale" })
+        let failure = BuildFailureClassifier.classify(f.text)
+        XCTAssertEqual(failure.kind, .staleProfile)
+        XCTAssertEqual(failure.detail, f.folder)
+        XCTAssertNil(failure.kind.overrideFlag, "there is no way to build around it")
+    }
+
     func testTheOlderSeveralGamesMessageStillClassifies() {   // the stable and experimental engine channels can still serve the text before the pin of cd859c38
         let log = "[RED] more than one game in the folder, keep one game per folder: 0100000000010000, 01006F8002326000"
         XCTAssertEqual(BuildFailureClassifier.classify(log).kind, .severalGames)
+    }
+
+    func testOnlyTheEnginesSelectableBaseTitleIDsAreOffered() throws {
+        let line = try XCTUnwrap(fixtures().first { $0.id == "games.several" }).text
+        let filename = "Game [0100000000003000].xci"
+        let contents = "\(filename) holds several titles: DLC 0100000000011001 v0, update 0100000000010800 v1"
+        XCTAssertEqual(BuildFailureClassifier.classify(contents + "\n" + line).titleIDs,
+                       ["0100000000010000", "01006F8002326000"])
+        for malformed in [line.replacingOccurrences(of: "01006F8002326000", with: "123"),
+                          line.replacingOccurrences(of: "01006F8002326000", with: "0100000000010000"),
+                          "Running: " + line, contents,
+                          "[RED] more than one game in the folder, keep one game per folder: 0100000000010000, 01006F8002326000"] {
+            XCTAssertTrue(BuildFailureClassifier.classify(malformed).titleIDs.isEmpty, malformed)
+        }
     }
 
     func testTheFailureIsFoundAboveTheLastLine() {
@@ -68,7 +95,8 @@ import NXModel
 
     func testUnknownOutputKeepsTodaysBehaviour() {
         for log in ["", "something odd happened", "[RED] the RomFS image failed",
-                    "[RED] the NSP is damaged: 3 files written as read (--allow-damaged)"] {   // the success note of a build that went on
+                    "[RED] the NSP is damaged: 3 files written as read (--allow-damaged)",
+                    "[RED] v131072: 3 file(s) whose bytes do not start as their names promise (a .zs file that is not a zstd stream), so the game files are damaged:\n  Tex/a.bntx.zs (216,015 bytes, starts 00000000)\npacked as they are (--allow-damaged)"] {   // the success note of a build that went on
             XCTAssertEqual(BuildFailureClassifier.classify(log), BuildFailure(kind: .unknown, gameName: nil), log)
         }
     }
@@ -90,6 +118,7 @@ import NXModel
     func testEveryHintIsInBothLanguagesWithoutSemicolons() {
         var keys = ["fail.section", "fail.buildAnyway", "fail.confirm.title", "fail.confirm.go", "fail.confirm.cancel", "fail.override.note",
                     "fail.a32Program.whatNamed", "fail.translator.button", "fail.iosSDK.button", "fail.cltSelected.button",
+                    "macFail.metalToolchain.button", "macFail.metalToolchain.copy", "macFail.updateMismatch.button", "macFail.updateMismatch.whatVersions",
                     "dep.metal.other", "dep.fix.metalPin", "fail.showFolder", "fail.openXcode", "fail.retry", "fail.keys.button",
                     "fail.driveMissing.whatNamed", "fail.diskFull.whatNeeds"]
         for k in BuildFailureKind.allCases where k != .unknown {
@@ -282,7 +311,7 @@ import NXModel
         }
         for (name, kind, lang) in [("hint-other-metal", BuildFailureKind.otherMetal, Lang.en), ("hint-ios-sdk", .iosSDK, .en), ("hint-damaged-nsp", .damagedNSP, .en),
                                    ("hint-other-metal-zh", .otherMetal, .zh)]
-                                  + [BuildFailureKind.keys, .severalGames, .noTitleID, .driveMissing, .diskFull, .teamTaken, .noSigningAccount, .deviceTransfer].flatMap { k in
+                                  + [BuildFailureKind.keys, .keysOld, .severalGames, .noTitleID, .driveMissing, .diskFull, .volumeFormat, .teamTaken, .noSigningAccount, .deviceTransfer].flatMap { k in
                                       [("row-\(k.rawValue)", k, Lang.en), ("row-\(k.rawValue)-zh", k, Lang.zh)] } {
             let mStores = LauncherStores(defaults: testDefaults); let m = mStores.build
             m.lang = CaptureLanguage.current(lang)
@@ -291,6 +320,44 @@ import NXModel
             try capture(name, width: 760, height: kind == .noTitleID ? 380 : 250, ZStack(alignment: .top) {
                 LauncherPalette.background
                 BuildFailureCard(m: m).environmentObject(mStores.localizer).padding(24)
+            })
+        }
+        let multiGame = try XCTUnwrap(fixtures().first { $0.id == "games.several" })
+        let files = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: files) }
+        let cartridge = files.appendingPathComponent("Collection.xci"), keys = files.appendingPathComponent("test.keys")
+        try Data().write(to: cartridge)
+        try Data().write(to: keys)
+        for lang in Lang.all {
+            let stores = LauncherStores(defaults: testDefaults)
+            stores.repo.path = Self.engine.path
+            stores.dependencies.checked = true
+            stores.dependencies.deps = [Dep(id: "test", name: "test", hint: "", present: true, installCmd: [])]
+            stores.build.take(picked: [cartridge.path], kind: .base)
+            stores.build.take(picked: [keys.path], kind: .keys)
+            stores.build.lang = lang
+            stores.build.logTail = multiGame.text
+            stores.build.noteFailure()
+            try capture("multi-game-\(lang.code)", width: 760, height: 250, ZStack(alignment: .top) {
+                LauncherPalette.background
+                BuildFailureCard(m: stores.build).environmentObject(stores.localizer).padding(24)
+            })
+        }
+        // Replay the real low-space stop through the classifier, including the raw-note fallback before a hint exists.
+        for lang in Lang.all {
+            let stores = LauncherStores(defaults: testDefaults)
+            let build = stores.build
+            build.lang = lang
+            build.doneNote = try XCTUnwrap(fixtures().first { $0.id == "pso.low" }).text
+            build.logTail = build.doneNote
+            build.noteFailure()
+            try capture("pso-low-\(lang.code)", width: 760, height: 360, ZStack(alignment: .top) {
+                LauncherPalette.background
+                VStack(alignment: .leading, spacing: 20) {
+                    ActionCard(build: build, dependencies: stores.dependencies, repo: stores.repo)
+                    BuildFailureCard(m: build)
+                }.environmentObject(stores.localizer).padding(24)
             })
         }
         let mStores = LauncherStores(defaults: testDefaults); let m = mStores.build
@@ -302,6 +369,51 @@ import NXModel
             LauncherPalette.background
             MetalRowPreview(dependencies: mStores.dependencies, t: m.t).padding(24)
         })
+    }
+
+    /// Opt-in native rendering for Apple error 9120 screenshots across all 10 languages (NX_LAUNCHER_CAPTURE_DIR).
+    @MainActor func testRenderAppIDLimitForVisualQA() throws {
+        guard let directory = ProcessInfo.processInfo.environment["NX_LAUNCHER_CAPTURE_DIR"] else { throw XCTSkip("Set NX_LAUNCHER_CAPTURE_DIR to capture native views") }
+        let output = URL(fileURLWithPath: directory)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        func capture(_ name: String, width: CGFloat, height: CGFloat, _ view: some View) throws {
+            let host = NSHostingView(rootView: view.preferredColorScheme(.dark).frame(width: width, height: height))
+            let window = OffscreenWindow(size: NSSize(width: width, height: height))
+            window.contentView = host
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+            host.layoutSubtreeIfNeeded()
+            let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: output.appendingPathComponent(name + ".png"))
+            window.orderOut(nil)
+        }
+        let log9120 = """
+        /tmp/shell/project/DmShell.xcodeproj: error: Failed to register bundle identifier: The app identifier "org.nxnative.shell" cannot be registered to your development team because it is not available. (9120) (in target 'DmShell' from project 'DmShell')
+        /tmp/shell/project/DmShell.xcodeproj: error: No profiles for 'org.nxnative.shell' were found: Xcode couldn't find any iOS App Development provisioning profiles matching 'org.nxnative.shell'. (in target 'DmShell' from project 'DmShell')
+        """
+        let errLine = "error: Failed to register bundle identifier: The app identifier \"org.nxnative.shell\" cannot be registered to your development team because it is not available. (9120)"
+        for lang in Lang.all {
+            let stores = LauncherStores(defaults: testDefaults)
+            let build = stores.build
+            stores.localizer.lang = lang
+            build.lang = lang
+            stores.deviceStore.signingTeam = "TEAM123456"
+            stores.deviceStore.readTeams = { [SigningTeam(id: "TEAM123456", identity: "Apple Development")] }
+            build.logTail = log9120
+            build.finishInstall(String(format: build.t("dev.signFailed"), errLine))
+            build.noteInstallFailure(.sign, error: build.doneNote)
+            try capture("mac-9120-\(lang.code)", width: 780, height: 420, ZStack(alignment: .top) {
+                LauncherPalette.background
+                VStack(alignment: .leading, spacing: 20) {
+                    ActionCard(build: build, dependencies: stores.dependencies, repo: stores.repo)
+                    BuildFailureCard(m: build)
+                }.environmentObject(stores.localizer).padding(24)
+            })
+        }
     }
 }
 

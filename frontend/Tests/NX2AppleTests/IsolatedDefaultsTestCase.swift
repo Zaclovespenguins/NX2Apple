@@ -1,23 +1,24 @@
 import XCTest
+@testable import NXLauncher
 
 /// The base of every test in this target. A test process shares one UserDefaults domain (`com.apple.dt.xctest.tool`), and the domain
 /// outlives the run: a key one test wrote, or a killed run left behind, was read by the next test and the next run (a stale
 /// `exportIPA` or a `repoPath` in a deleted folder failed the shell install tests).
 ///
-/// - `testDefaults` is a suite of its own for the test, removed after it. A test hands it to `LauncherStores(defaults:)` and to every
-///   store or helper that takes a `defaults`, so nothing reads or writes the shared domain.
+/// - `testDefaults` is a suite of its own for the test, from `TestDefaults`, so no file of it stays in `~/Library/Preferences`.
+///   A test hands it to `LauncherStores(defaults:)` and to every store or helper that takes a `defaults`, so nothing reads or
+///   writes the shared domain.
 /// - The shared domain is emptied once per process, so a leftover of an earlier run is gone before the first test.
 /// - After each test the shared domain must be as it was before: a test that leaves a key there fails, and the key is put back.
 class IsolatedDefaultsTestCase: XCTestCase {
     /// The suite of this test, created on first use.
     var testDefaults: UserDefaults {
-        if let suite = isolatedSuite { return suite.defaults }
-        let name = "nx2apple-test-" + UUID().uuidString
-        let defaults = UserDefaults(suiteName: name)!
-        isolatedSuite = (name, defaults)
+        if let suite = isolatedSuite { return suite }
+        let defaults = TestDefaults.make("nx2apple-test")
+        isolatedSuite = defaults
         return defaults
     }
-    private var isolatedSuite: (name: String, defaults: UserDefaults)?
+    private var isolatedSuite: UserDefaults?
 
     /// The domain the process reads and writes through `UserDefaults.standard`.
     static var sharedDomain: String { Bundle.main.bundleIdentifier ?? ProcessInfo.processInfo.processName }
@@ -33,10 +34,6 @@ class IsolatedDefaultsTestCase: XCTestCase {
         let before = Self.sharedKeys()
         isolatedSuite = nil
         super.invokeTest()
-        if let suite = isolatedSuite {
-            UserDefaults().removePersistentDomain(forName: suite.name)
-            try? FileManager.default.removeItem(atPath: NSHomeDirectory() + "/Library/Preferences/\(suite.name).plist")   // no file per test
-        }
         isolatedSuite = nil
         let after = Self.sharedKeys()
         let changed = Set(before.keys).union(after.keys).filter { !Self.same(before[$0], after[$0]) }.sorted()
@@ -68,5 +65,30 @@ final class SharedDefaultsGuardTests: IsolatedDefaultsTestCase {
 
     func testTheSharedDomainIsEmptyBeforeTheTest() {
         XCTAssertTrue(Self.sharedKeys().isEmpty, "left over: \(Self.sharedKeys().keys.sorted())")
+    }
+}
+
+/// The appearance choice (`LauncherAppearance.defaultsKey`) is read by every hosted view through `@AppStorage`, so a test that
+/// leaves it in the shared domain turns the next test's window Light or Dark. A test that needs a choice saves it to
+/// `testDefaults` and gives the view `.defaultAppStorage(testDefaults)`.
+final class AppearanceKeyGuardTests: IsolatedDefaultsTestCase {
+    func testTheAppearanceKeyIsNotInTheSharedDomain() {
+        XCTAssertNil(Self.sharedKeys()[LauncherAppearance.defaultsKey], "an earlier test left the appearance choice in the shared defaults")
+    }
+
+    func testNoTestWritesTheAppearanceToTheSharedDefaults() throws {
+        let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let write = try NSRegularExpression(pattern: #"(UserDefaults\.standard|\.standard)\.(set|removeObject)\([^)]*(LauncherAppearance\.defaultsKey|"appearance")"#)
+        var offenders: [String] = []
+        let files = FileManager.default.enumerator(at: tests, includingPropertiesForKeys: nil)?.compactMap { $0 as? URL } ?? []
+        for file in files where file.pathExtension == "swift" && file.lastPathComponent != "IsolatedDefaultsTestCase.swift" {
+            let text = try String(contentsOf: file, encoding: .utf8)
+            for (n, line) in text.components(separatedBy: "\n").enumerated()
+            where write.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
+                offenders.append("\(file.lastPathComponent):\(n + 1)")
+            }
+        }
+        XCTAssertFalse(files.isEmpty, "the test sources are next to this file")
+        XCTAssertEqual(offenders, [], "save the choice to testDefaults and use .defaultAppStorage(testDefaults)")
     }
 }

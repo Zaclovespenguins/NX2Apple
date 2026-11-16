@@ -118,6 +118,29 @@ package enum AppUpdate {
         case readOnly    // a released copy that cannot be replaced where it is (translocated, or a folder without write access)
     }
 
+    /// Where the copy at `bundle` really is. Gatekeeper runs a quarantined app that was never moved in the Finder from a
+    /// read-only copy under /private/var/folders/…/AppTranslocation/: an app unzipped straight into Applications, or moved
+    /// there with mv or a script, runs from there on every launch (#873). The original is what an update replaces and
+    /// relaunches. `original` is the Security framework's answer (a stand-in in the tests). A path it cannot resolve stays
+    /// as it is, and `installability` then calls it read-only.
+    package static func untranslocated(_ bundle: URL, original: (URL) -> URL? = translocationOriginal) -> URL {
+        guard bundle.path.contains("/AppTranslocation/"), let found = original(bundle) else { return bundle }
+        return found
+    }
+
+    /// `SecTranslocateCreateOriginalPathForURL`, in Security.framework since macOS 10.12 but not in its Swift interface, so
+    /// it is looked up by name. nil when the lookup fails or the URL is not a translocated one (the function then hands
+    /// back the URL it was given).
+    package static func translocationOriginal(_ url: URL) -> URL? {
+        typealias CreateOriginal = @convention(c) (CFURL, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFURL>?
+        guard let security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+              let symbol = dlsym(security, "SecTranslocateCreateOriginalPathForURL")
+        else { return nil }
+        let createOriginal = unsafeBitCast(symbol, to: CreateOriginal.self)
+        guard let found = createOriginal(url as CFURL, nil)?.takeRetainedValue() as URL? else { return nil }
+        return found.standardizedFileURL.path == url.standardizedFileURL.path ? nil : found
+    }
+
     /// Whether the launcher at `bundle` may replace itself. A released copy is an `.app` whose Info.plist has a bundle
     /// identifier and, as its version, this binary's own release number (the release workflow stops when the two
     /// differ), and which is not where a developer's build sits: in SwiftPM's .build, Xcode's DerivedData, or beside
@@ -136,7 +159,7 @@ package enum AppUpdate {
               let id = info["CFBundleIdentifier"] as? String, !id.isEmpty,
               info["CFBundleShortVersionString"] as? String == appVersion
         else { return .developer }
-        // Gatekeeper runs a quarantined app opened from Downloads from a read-only copy: the swap cannot reach the real one
+        // A translocated copy whose original `untranslocated` could not find: the swap cannot reach the real one
         if path.contains("/AppTranslocation/") { return .readOnly }
         if !FileManager.default.isWritableFile(atPath: parent.path) { return .readOnly }
         return .ok
@@ -173,42 +196,102 @@ package enum AppUpdate {
             : current.deletingLastPathComponent().appendingPathComponent(staged.lastPathComponent)
     }
 
+    /// File operations used by `install`, injectable so tests can simulate partial bundle moves and verify rollback.
+    package struct InstallFileOps {
+        package var fileExists: (URL) -> Bool
+        package var copyItem: (URL, URL) throws -> Void
+        package var moveItem: (URL, URL) throws -> Void
+        package var removeItem: (URL) throws -> Void
+        package var trashItem: (URL) throws -> Void
+
+        package init(
+            fileExists: @escaping (URL) -> Bool,
+            copyItem: @escaping (URL, URL) throws -> Void,
+            moveItem: @escaping (URL, URL) throws -> Void,
+            removeItem: @escaping (URL) throws -> Void,
+            trashItem: @escaping (URL) throws -> Void
+        ) {
+            self.fileExists = fileExists
+            self.copyItem = copyItem
+            self.moveItem = moveItem
+            self.removeItem = removeItem
+            self.trashItem = trashItem
+        }
+
+        package static let live = InstallFileOps(
+            fileExists: { FileManager.default.fileExists(atPath: $0.path) },
+            copyItem: { try FileManager.default.copyItem(at: $0, to: $1) },
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { try FileManager.default.removeItem(at: $0) },
+            trashItem: { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }
+        )
+    }
+
     /// Install the staged app and return where it ended up (the caller relaunches that path).
-    package static func install(_ staged: URL, over current: URL, buildRunning: Bool, trashOld: Bool = true,
-                                runner: ProcessRunner = SystemProcessRunner()) throws -> URL {
+    package static func install(
+        _ staged: URL,
+        over current: URL,
+        buildRunning: Bool,
+        trashOld: Bool = true,
+        runner: ProcessRunner = SystemProcessRunner(),
+        fileOps: InstallFileOps = .live
+    ) throws -> URL {
         guard !buildRunning else { throw InstallError.buildRunning }
-        let fm = FileManager.default
         let dir = current.deletingLastPathComponent()
         let target = installTarget(for: staged, current: current)
-        if target != current {
-            // A rename: place the staged bundle under its own name, then retire the old-named one.
-            // The running copy is trashed last — on macOS a running executable survives the removal
-            // of its bundle (the kernel holds the vnode), and the quit-time path runs this as the
-            // app is exiting anyway.
-            try? fm.removeItem(at: target)
-            try fm.copyItem(at: staged, to: target)
-            clearQuarantine(target, runner: runner)
-            if trashOld { try? fm.trashItem(at: current, resultingItemURL: nil) }
-            return target
-        }
-        let name = current.deletingPathExtension().lastPathComponent
-        let incoming = dir.appendingPathComponent(name + " (new).app")
-        let backupName = name + " (old).app"
-        try? fm.removeItem(at: incoming)
-        try? fm.removeItem(at: dir.appendingPathComponent(backupName))
+        let targetName = target.deletingPathExtension().lastPathComponent
+        let incoming = dir.appendingPathComponent(targetName + " (new).app")
+        let backup = dir.appendingPathComponent(targetName + " (old).app")
+        try? fileOps.removeItem(incoming)
+        try? fileOps.removeItem(backup)
         do {
-            try fm.copyItem(at: staged, to: incoming)
-            let placed = try fm.replaceItemAt(current, withItemAt: incoming, backupItemName: backupName, options: [.withoutDeletingBackupItem])
-            let backup = dir.appendingPathComponent(backupName)
-            if fm.fileExists(atPath: backup.path) {
-                if trashOld { try? fm.trashItem(at: backup, resultingItemURL: nil) } else { try? fm.removeItem(at: backup) }
-            }
-            clearQuarantine(placed ?? current, runner: runner)
-            return current
+            try fileOps.copyItem(staged, incoming)
         } catch {
-            try? fm.removeItem(at: incoming)
+            try? fileOps.removeItem(incoming)
             throw InstallError.failed(error.localizedDescription)
         }
+
+        var movedBackup: URL?
+        if fileOps.fileExists(target) {
+            do {
+                try fileOps.moveItem(target, backup)
+                movedBackup = backup
+            } catch {
+                if !fileOps.fileExists(target), fileOps.fileExists(backup) {
+                    try? fileOps.moveItem(backup, target)
+                }
+                try? fileOps.removeItem(incoming)
+                throw InstallError.failed(error.localizedDescription)
+            }
+        }
+
+        do {
+            try fileOps.moveItem(incoming, target)
+        } catch {
+            try? fileOps.removeItem(target)
+            if let movedBackup {
+                try? fileOps.moveItem(movedBackup, target)
+            }
+            try? fileOps.removeItem(incoming)
+            throw InstallError.failed(error.localizedDescription)
+        }
+
+        if let movedBackup {
+            if trashOld, target == current {
+                do {
+                    try fileOps.trashItem(movedBackup)
+                } catch {
+                    try? fileOps.removeItem(movedBackup)
+                }
+            } else {
+                try? fileOps.removeItem(movedBackup)
+            }
+        }
+        clearQuarantine(target, runner: runner)
+        if target != current, trashOld {
+            try? fileOps.trashItem(current)
+        }
+        return target
     }
 
     /// The shell script behind `relaunch`: wait until `$1` (a pid) has exited, at most `$3` ticks of 0.2 s,

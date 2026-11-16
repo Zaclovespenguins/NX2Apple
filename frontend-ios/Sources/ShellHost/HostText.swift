@@ -4,7 +4,13 @@ import ShellUI
 /// The host layer's own words, from `Resources/Localizable.xcstrings` (English source, like ShellUI). The catalog is generated from
 /// `frontend/l10n/*.json` (`ios.host.*`) by `tools/l10n_shell_catalogs.py`: change a text there, not in the catalog.
 func hostText(_ key: String.LocalizationValue) -> String {
-    String(localized: key, bundle: .module)
+    String(localized: key, bundle: HostStrings.bundle)
+}
+
+enum HostStrings {
+    /// Visual QA renders one language's `.lproj` whatever the Mac's language is, as `ShellStrings.captureBundle` does. Nil in the app.
+    nonisolated(unsafe) static var captureBundle: Bundle?
+    static var bundle: Bundle { captureBundle ?? .module }
 }
 
 /// What is wrong with a bundle that cannot run at all. Each cause has one plain sentence for the player.
@@ -57,4 +63,22 @@ public struct GameProblem: Error, Equatable, Sendable, LocalizedError {
 
     /// The broken state a tile shows: the short reason, the player's sentence and the technical message.
     public var state: GameState { .broken(reason: reason, detail: cause.message, technical: detail) }
+}
+
+/// Maps known English C launch errors from `ShellMain.m` to localized `ShellHost` catalog strings.
+public func localizeEngineLaunchError(_ raw: String) -> String {
+    switch raw {
+    case "This game was updated while the app was open. Close and reopen the app to load the new build.":
+        return hostText("This game was updated while the app was open. Close and reopen the app to load the new build.")
+    case "A game is already running.":
+        return hostText("A game is already running.")
+    case "The game's start arguments are incomplete.":
+        return hostText("The game's start arguments are incomplete.")
+    case "This game's framework in Documents/Frameworks is unsigned. Install the game again from NX2Apple.":
+        return hostText("This game's framework in Documents/Frameworks is unsigned. Install the game again from NX2Apple.")
+    case "iOS refused the code signature of this game's framework. Install the game again from NX2Apple.":
+        return hostText("iOS refused the code signature of this game's framework. Install the game again from NX2Apple.")
+    default:
+        return raw
+    }
 }

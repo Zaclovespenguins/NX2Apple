@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -41,6 +42,9 @@ def stamp_key(root: str | Path) -> str:
     for name in _series(root):
         data = (root / 'patches' / name).read_bytes()
         h.update(b'patch ' + name.encode() + b'\n' + hashlib.sha256(data).hexdigest().encode() + b'\n')
+    sw = root / 'patches' / 'fork_env_switches.tsv'
+    if sw.is_file():
+        h.update(b'switches ' + hashlib.sha256(sw.read_bytes()).hexdigest().encode() + b'\n')
     return h.hexdigest()
 
 
@@ -74,6 +78,8 @@ def _head(eng: Path) -> str:
 
 def is_stale(repo: str) -> bool:
     """True when the checkout can make engine/ and engine/ is missing or not built from the current pin and series."""
+    if bundled_engine():
+        return False   # a bundled engine never needs a sync
     if not has_engine_tool(repo):
         return False
     eng = Path(repo, 'engine')
@@ -84,8 +90,33 @@ def is_stale(repo: str) -> bool:
         return True
 
 
+def bundled_engine() -> str:
+    """The engine tree the Actions zip puts beside the app folder (`<exe_dir>/../engine/`).
+    Empty string when it is not there or does not look like an engine tree.
+
+    Also resolves when imported from an external Python (the build's venv) inside a PyInstaller
+    on-dir layout (`<root>/NX2Apple/_internal/nspb_qt/engine.py`), where `sys.frozen` is
+    False in the child interpreter.
+    """
+    bases: list[Path] = []
+    if getattr(sys, 'frozen', False):
+        exe = Path(sys.executable).resolve()
+        bases.extend((exe.parent, exe.parent.parent))
+    here = Path(__file__).resolve()
+    if len(here.parents) >= 4 and here.parents[1].name == '_internal':
+        bases.extend((here.parents[2], here.parents[3]))
+    for base in bases:
+        cand = base / 'engine'
+        if cand.joinpath('dm', 'games').is_dir() and cand.joinpath('scripts', 'build_ipa_from_nsp.py').is_file():
+            return str(cand)
+    return ''
+
+
 def engine_root(repo: str) -> str:
     """The folder holding dm/ and scripts/ for this checkout (see the module's rule)."""
+    bundled = bundled_engine()
+    if bundled:
+        return bundled
     if not repo:
         return repo
     eng = Path(repo, 'engine')
@@ -97,8 +128,8 @@ def engine_root(repo: str) -> str:
 
 
 def is_checkout(d: str) -> bool:
-    """A folder the launcher can build from: a checkout with tools/engine.py to make engine/, a synced engine/, or an engine tree."""
-    return bool(d) and (Path(d, *MARKER).is_file() or Path(d, 'engine', *MARKER).is_file() or has_engine_tool(d))
+    """A folder the launcher can build from: a checkout with tools/engine.py to make engine/, a synced engine/, an engine tree, or a bundled engine beside the app."""
+    return bool(bundled_engine()) or (bool(d) and (Path(d, *MARKER).is_file() or Path(d, 'engine', *MARKER).is_file() or has_engine_tool(d)))
 
 
 def needs_sync_before_build(repo: str) -> bool:
@@ -123,7 +154,7 @@ def run_sync(cmd: list[str], cwd: str, line: Callable[[str], None], **popen) -> 
     """Run the sync command, pass its lines on, and return (ok, failure kind or None). Blocking: call it off the UI thread."""
     tail = ''
     try:
-        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', **popen)
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', **popen)
         assert p.stdout is not None
         for out in p.stdout:
             line(out)

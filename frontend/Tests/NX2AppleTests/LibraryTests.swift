@@ -15,24 +15,24 @@ import NXModel
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
     }
 
-    /// Every test app carries this bundle ID, so a saved choice goes to a preferences domain of this run and never to a real game's.
-    private var bundleID: String { "org.nxnative.frontendtests." + temporary.lastPathComponent }
+    /// Every test app carries this bundle ID, so a saved choice goes to a preferences domain of this run and never to a real game's,
+    /// a plist in the test's folder (`TestPreferences`).
+    private var bundleID: String { TestPreferences.domain(in: temporary, "library") }
 
     override func tearDownWithError() throws {
-        let domain = bundleID as CFString
-        for key in (CFPreferencesCopyKeyList(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? [String]) ?? [] { CFPreferencesSetAppValue(key as CFString, nil, domain) }
-        CFPreferencesAppSynchronize(domain)
+        CFPreferencesAppSynchronize(bundleID as CFString)
         try FileManager.default.removeItem(at: temporary)
     }
 
-    private func makeApp(_ titleID: String, name: String = "Hades") throws -> URL {
+    private func makeApp(_ titleID: String, name: String = "Hades", titleNames: [String: String]? = nil) throws -> URL {
         let app = temporary.appendingPathComponent(name + ".app")
         let executables = app.appendingPathComponent("Contents/MacOS")
         try FileManager.default.createDirectory(at: executables, withIntermediateDirectories: true)
         for name in ["nxnative", "dmhost"] {
             try FileManager.default.createSymbolicLink(at: executables.appendingPathComponent(name), withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
         }
-        let info: [String: Any] = ["DMTitleID": titleID, "CFBundleDisplayName": name, "CFBundleExecutable": "nxnative", "CFBundleIdentifier": bundleID]
+        var info: [String: Any] = ["DMTitleID": titleID, "CFBundleDisplayName": name, "CFBundleExecutable": "nxnative", "CFBundleIdentifier": bundleID]
+        if let titleNames { info["DMTitleNames"] = titleNames }
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: app.appendingPathComponent("Contents/Info.plist"))
         return app
@@ -40,13 +40,107 @@ import NXModel
 
     /// The library opens on the player's own games: Owned is the default, also for the "all" an earlier build may have stored.
     func testLibraryFilterDefaultsToOwned() throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "nxnative-tests-filter-" + temporary.lastPathComponent))
+        let defaults = TestDefaults.make("nxnative-tests-filter")
         XCTAssertEqual(LibraryFilter.load(defaults), .owned)
         defaults.set("all", forKey: "libraryFilter")
         XCTAssertEqual(LibraryFilter.load(defaults), .owned)
         LibraryFilter.built.save(defaults)
         XCTAssertEqual(LibraryFilter.load(defaults), .built)
-        defaults.removePersistentDomain(forName: "nxnative-tests-filter-" + temporary.lastPathComponent)
+    }
+
+    func testLibraryTitleOrderUsesNumbersAndKeepsSelection() {
+        let ten = LibraryGame(titleID: "C", name: "Quest 10")
+        let two = LibraryGame(titleID: "B", name: "Quest 2")
+        let anotherTwo = LibraryGame(titleID: "A", name: "Quest 2")
+        let games = [ten, two, anotherTwo]
+        XCTAssertEqual(LibraryFilter.owned.visibleGames(games).map(\.id), [anotherTwo.id, two.id, ten.id])
+        XCTAssertEqual(LibraryFilter.owned.visibleGames(games, matching: "qUeSt 2").map(\.id), [anotherTwo.id, two.id])
+        XCTAssertTrue(LibraryFilter.built.visibleGames(games).isEmpty)
+        XCTAssertEqual(LibraryFilter.owned.reconcile(games: games, selectedID: nil, focused: nil).selectedID, anotherTwo.id)
+        XCTAssertEqual(LibraryFilter.owned.reconcile(games: games, selectedID: ten.id, focused: nil).selectedID, ten.id)
+    }
+
+    /// A game packed with its control data's names shows the one of the launcher's language, and the library keeps the bundle name
+    /// as it is: the names are only what is shown (LauncherView, the console mode, the sheets). The search finds it by either.
+    func testGameNameFollowsLauncherLanguage() throws {
+        let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        let names = ["en-US": "Ys Origin", "ja": "イース・オリジン", "zh-Hans": "伊苏 起源"]
+        let id = try library.addApp(makeApp(titleID, name: "Ys Origin", titleNames: names))
+        let game = try XCTUnwrap(library.games.first { $0.id == id })
+        XCTAssertEqual(game.name, "Ys Origin")
+        XCTAssertEqual(game.titleNames, names)
+        XCTAssertEqual(game.displayName(.zh), "伊苏 起源")
+        XCTAssertEqual(game.displayName(Lang("ja")), "イース・オリジン")
+        XCTAssertEqual(game.displayName(.en), "Ys Origin")
+        XCTAssertEqual(game.displayName(Lang("sv")), "Ys Origin")   // no Swedish title: the English one
+        XCTAssertEqual(LibraryFilter.owned.visibleGames(library.games, matching: "伊苏", lang: .zh).map(\.id), [id])
+        XCTAssertEqual(LibraryFilter.owned.visibleGames(library.games, matching: "ys orig", lang: .zh).map(\.id), [id])
+
+        // Saved and read again; a library from before the names has none and shows the bundle name
+        let again = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        XCTAssertEqual(again.games.first?.titleNames, names)
+        let old = try JSONDecoder().decode(LibraryGame.self, from: Data(#"{"id":"\#(UUID().uuidString)","titleID":"\#(titleID)","name":"Ys Origin"}"#.utf8))
+        XCTAssertEqual(old.titleNames, [:])
+        XCTAssertEqual(old.displayName(.zh), "Ys Origin")
+    }
+
+    /// Sorted by the name shown: a Chinese launcher orders the games by their Chinese names.
+    func testLibraryOrderFollowsShownName() {
+        var b = LibraryGame(titleID: "B", name: "Beta"); b.titleNames = ["zh-Hans": "Aaa 甲"]
+        let a = LibraryGame(titleID: "A", name: "Alpha")
+        XCTAssertEqual(LibraryFilter.owned.visibleGames([a, b], lang: .en).map(\.titleID), ["A", "B"])
+        XCTAssertEqual(LibraryFilter.owned.visibleGames([a, b], lang: .zh).map(\.titleID), ["B", "A"])
+    }
+
+    func testCommandFFromBuildsOpensLibrarySearch() throws {
+        let stores = LauncherStores(defaults: testDefaults)
+        let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        let view = LauncherView(stores: stores, library: library, initialPage: .builds, performStartupChecks: false)
+        let window = OffscreenWindow(size: NSSize(width: 1100, height: 800))
+        let host = NSHostingView(rootView: view)
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let find = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                                                  timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                  characters: "f", charactersIgnoringModifiers: "f", isARepeat: false, keyCode: 3))
+        XCTAssertTrue(window.performKeyEquivalent(with: find))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        func searchField(in view: NSView) -> NSTextField? {
+            if let field = view as? NSTextField, field.placeholderString == stores.localizer.t("library.search") { return field }
+            return view.subviews.lazy.compactMap { searchField(in: $0) }.first
+        }
+        XCTAssertNotNil(searchField(in: host), "the search field is now in the window")
+    }
+
+    func testMinimumWidthToolbarKeepsControlsOnOneLine() throws {
+        let stores = LauncherStores(defaults: testDefaults)
+        stores.build.lang = Lang("fr")
+        stores.appUpdates.update = .init(tag: "v9.9.9", url: "", digest: nil)
+        let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        let pad = PadFocus()
+        let view = LauncherView(stores: stores, library: library, performStartupChecks: false, search: "zel", padFocus: pad)
+        let window = OffscreenWindow(size: NSSize(width: 1440, height: 680))
+        window.contentView = NSHostingView(rootView: view)
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+
+        let singleLine = try XCTUnwrap(pad.frames["main"])
+        window.setContentSize(NSSize(width: 900, height: 680))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let targets = try XCTUnwrap(pad.frames["main"])
+        for id in ["tab.library", "tab.builds", "tab.settings", "top.build"] {
+            let frame = try XCTUnwrap(targets.first { $0.id == id }?.frame, id)
+            let wide = try XCTUnwrap(singleLine.first { $0.id == id }?.frame, id)
+            XCTAssertLessThanOrEqual(frame.height, wide.height + 1, "The top bar should fit a single line: " + id)
+        }
+        pad.show(default: "tab.library")
+        pad.horizontal(1)
+        XCTAssertEqual(pad.focused, "tab.builds")
+        pad.horizontal(1)
+        XCTAssertEqual(pad.focused, "tab.settings")
     }
 
     /// Built hides the games without a build. The selection moves to a game it shows, and a controller's focus on a hidden card
@@ -111,10 +205,12 @@ import NXModel
         let id = try library.addApp(app)
         let image = temporary.appendingPathComponent("my-picture.png")
         try Data("not game data".utf8).write(to: image)
-        library.setArtwork(image.path, for: id)
+        library.setArtwork(GameArtwork(hero: ArtworkChoice(source: .imported(image.lastPathComponent))), for: id)
         let restored = GameLibrary(file: file)
+        XCTAssertEqual(restored.artworkDirectory, temporary.appendingPathComponent("state/artwork", isDirectory: true),
+                       "a library kept elsewhere never touches the player's artwork folder")
         XCTAssertEqual(restored.games.count, 1)
-        XCTAssertEqual(restored.games.first?.artworkPath, image.path)
+        XCTAssertEqual(restored.games.first?.artwork.hero?.source, .imported("my-picture.png"))
         XCTAssertEqual(restored.games.first?.appPath, app.path)
         XCTAssertTrue(restored.games[0].isReady)
         restored.remove(id)
@@ -160,14 +256,53 @@ import NXModel
         XCTAssertEqual(library.selectedID, library.games[0].id)
     }
 
+    func testBuildOfPathKeyedEntryTakesTheOldEntrysImagesAlong() throws {
+        let app = try makeApp(titleID)
+        let file = temporary.appendingPathComponent("library.json")
+        var existing = LibraryGame(titleID: titleID, name: "Hades")
+        existing.appPath = app.path
+        existing.artwork.hero = ArtworkChoice(source: .imported("mine.jpg"), focus: ArtworkFocus(x: 0.2, y: 0.5))
+        var pending = LibraryGame(titleID: "/games/Hades.nsp", name: "Hades")
+        pending.inputs = ["base": ["/games/Hades.nsp"]]
+        try JSONEncoder().encode([existing, pending]).write(to: file)
+        let library = GameLibrary(file: file)
+        let from = ArtworkStore.customDirectory(for: existing.id, in: library.artworkDirectory)
+        try FileManager.default.createDirectory(at: from, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: from.appendingPathComponent("mine.jpg"))
+        library.recordCompletedApp(path: app.path, for: pending.id)
+        XCTAssertEqual(library.games[0].artwork.hero, existing.artwork.hero)
+        let to = ArtworkStore.customDirectory(for: pending.id, in: library.artworkDirectory)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: to.appendingPathComponent("mine.jpg").path), "the image goes to the entry that stays")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: from.path))
+    }
+
+    /// #895: a build that merges a path-keyed entry into the game's existing one keeps the player's name for it and the names it
+    /// had in other languages when the new app carries none.
+    func testBuildOfPathKeyedEntryKeepsTheGamesNames() throws {
+        let app = try makeApp(titleID)
+        let file = temporary.appendingPathComponent("library.json")
+        var existing = LibraryGame(titleID: titleID, name: "Hades")
+        existing.appPath = app.path
+        existing.customName = "My Hades"
+        existing.titleNames = ["ja": "ハデス"]
+        var pending = LibraryGame(titleID: "/games/Hades.nsp", name: "Hades")
+        pending.inputs = ["base": ["/games/Hades.nsp"]]
+        try JSONEncoder().encode([existing, pending]).write(to: file)
+        let library = GameLibrary(file: file)
+        library.recordCompletedApp(path: app.path, for: pending.id)
+        XCTAssertEqual(library.games.count, 1)
+        XCTAssertEqual(library.games[0].customName, "My Hades")
+        XCTAssertEqual(library.games[0].titleNames, ["ja": "ハデス"])
+    }
+
     func testRebuildingSameGameKeepsOneEntryAndCustomArtwork() throws {
         let app = try makeApp(titleID)
         let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
         let first = try library.addApp(app)
-        library.setArtwork("/some/external/artwork.jpg", for: first)
+        library.setArtwork(GameArtwork(hero: ArtworkChoice(source: .imported("artwork.jpg"))), for: first)
         XCTAssertEqual(try library.addApp(app), first)
         XCTAssertEqual(library.games.count, 1)
-        XCTAssertEqual(library.games[0].artworkPath, "/some/external/artwork.jpg")
+        XCTAssertEqual(library.games[0].artwork.hero?.source, .imported("artwork.jpg"))
     }
 
     private func writeSettings(_ app: URL) throws {
@@ -533,6 +668,47 @@ import NXModel
         XCTAssertEqual(zelda.inputs["dlc"], [])
     }
 
+    /// The base sits in "<game>/nsz本体/", the update in "<game>/升级档v1.1.3/" and the DLC in "<game>/DLC/" (sibling
+    /// subfolders under the game's folder, with no package directly in "<game>/"): the climb must still reach "<game>/"
+    /// and a rescan must lift a previously recorded subfolder sourceFolder to it.
+    func testAScanFindsTheUpdateAndDLCInSiblingSubfolders() throws {
+        let fm = FileManager.default
+        let game = temporary.appendingPathComponent("小丑牌")
+        let baseDir = game.appendingPathComponent("nsz本体")
+        let updDir = game.appendingPathComponent("升级档v1.1.3")
+        let dlcDir = game.appendingPathComponent("DLC")
+        for d in [baseDir, updDir, dlcDir] { try fm.createDirectory(at: d, withIntermediateDirectories: true) }
+        let baseNSZ = baseDir.appendingPathComponent("小丑牌[0100CD801CE5E000][US][v0].nsz")
+        let updNSZ = updDir.appendingPathComponent("小丑牌[0100CD801CE5E800][US][v393216].nsz")
+        let dlcNSZ = dlcDir.appendingPathComponent("小丑牌[0100CD801CE5F001][v65536].nsz")
+        for f in [baseNSZ, updNSZ, dlcNSZ] { try Data([0]).write(to: f) }
+
+        let games = GameLibrary.sourceGames(in: temporary, repo: "")
+        let balatro = try XCTUnwrap(games.first { $0.titleID == "0100CD801CE5E000" })
+        XCTAssertEqual(Self.canon(balatro.sourceFolder), Self.canon(game.path), "climbs out of nsz本体 when a sibling subfolder holds the update")
+        XCTAssertEqual(balatro.inputs["base"]?.map(Self.canon), [Self.canon(baseNSZ.path)])
+        XCTAssertEqual(balatro.inputs["update"]?.map(Self.canon), [Self.canon(updNSZ.path)])
+        XCTAssertEqual(balatro.inputs["dlc"]?.map(Self.canon), [Self.canon(dlcNSZ.path)])
+
+        // An earlier scan recorded the base subfolder as sourceFolder and missed the sibling update: discover() repairs both.
+        let state = temporary.appendingPathComponent("library.json")
+        var stale = LibraryGame(titleID: "0100CD801CE5E000", name: "Balatro")
+        stale.inputs = ["base": [baseNSZ.path], "update": [], "dlc": [], "keys": []]
+        stale.sourceFolder = baseDir.path
+        try JSONEncoder().encode([stale]).write(to: state)
+        let library = GameLibrary(file: state)
+        library.applicationFolders = []
+        let finished = expectation(description: "Rescan repairs sibling update and sourceFolder")
+        let token = library.$scanning.dropFirst().filter { !$0 }.sink { _ in finished.fulfill() }
+        library.setFolder(temporary)
+        wait(for: [finished], timeout: 3)
+        withExtendedLifetime(token) {}
+        let repaired = try XCTUnwrap(library.games.first { $0.titleID == "0100CD801CE5E000" })
+        XCTAssertEqual(Self.canon(repaired.sourceFolder), Self.canon(game.path))
+        XCTAssertEqual(repaired.inputs["update"]?.map(Self.canon), [Self.canon(updNSZ.path)])
+        XCTAssertEqual(repaired.inputs["dlc"]?.map(Self.canon), [Self.canon(dlcNSZ.path)])
+    }
+
     /// Base, update and DLC in one folder: the folder is its own game folder and the climb goes no further.
     func testAScanOfAFlatGameFolderStopsAtThatFolder() throws {
         let flat = temporary.appendingPathComponent("Hades")
@@ -548,6 +724,37 @@ import NXModel
         XCTAssertEqual(hades.inputs["dlc"]?.map(Self.canon), [Self.canon(flat.appendingPathComponent(files[2]).path)])
     }
 
+    func testAScanRetainsCollectionEnumerationWhenRootHoldsANUPBesideAGameFolder() throws {
+        let fm = FileManager.default
+        let collection = temporary.appendingPathComponent("Collection")
+        let nupURL = collection.appendingPathComponent("GameA.nup")
+        let dumpB = collection.appendingPathComponent("DumpB")
+        try fm.createDirectory(at: dumpB.appendingPathComponent("base/exefs"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: dumpB.appendingPathComponent("base/romfs"), withIntermediateDirectories: true)
+
+        var nup = [UInt8](repeating: 0, count: 0x80 + 0x30 + 0x40)
+        func put(_ o: Int, _ v: UInt64, _ n: Int) { for i in 0..<n { nup[o + i] = UInt8(v >> (8 * UInt64(i)) & 0xFF) } }
+        nup.replaceSubrange(0..<4, with: [0x4E, 0x55, 0x50, 0x01])
+        put(0x08, 0x80, 8); put(0x40, UInt64(nup.count), 8); put(0x48, 1, 4)
+        nup.replaceSubrange(0x80..<0x84, with: [0x54, 0x4F, 0x43, 0x01])
+        put(0xB0, 0x040074A01BF12000, 8)
+        try Data(nup).write(to: nupURL)
+        try GameFolderCaptureTests.npdm(programID: 0x0400A3A01EE4C000).write(to: dumpB.appendingPathComponent("base/exefs/main.npdm"))
+
+        for root in [collection, temporary!] {
+            XCTAssertEqual(GameFolder.resolve(root.path), root.path, "failed for \(root.path)")
+            XCTAssertFalse(GameFolder.isCandidate(root.path), "failed for \(root.path)")
+            let games = GameLibrary.sourceGames(in: root, repo: "")
+            XCTAssertEqual(Set(games.map(\.titleID)), ["040074A01BF12000", "0400A3A01EE4C000"], "failed for \(root.path)")
+            let gameA = try XCTUnwrap(games.first { $0.titleID == "040074A01BF12000" })
+            let gameB = try XCTUnwrap(games.first { $0.titleID == "0400A3A01EE4C000" })
+            XCTAssertEqual(Self.canon(gameA.sourceFolder), Self.canon(collection.path))
+            XCTAssertEqual(gameA.inputs[GameLibrary.folderInput]?.map(Self.canon), [Self.canon(nupURL.path)])
+            XCTAssertEqual(Self.canon(gameB.sourceFolder), Self.canon(dumpB.path))
+            XCTAssertEqual(gameB.inputs[GameLibrary.folderInput]?.map(Self.canon), [Self.canon(dumpB.path)])
+        }
+    }
+
     func testReadOnlyScanOfConfiguredFolder() throws {
         guard let path = ProcessInfo.processInfo.environment["NX_LAUNCHER_SCAN_FOLDER"] else { throw XCTSkip("Set NX_LAUNCHER_SCAN_FOLDER for a read-only scan of real builds") }
         let apps = GameLibrary.builtApps(in: URL(fileURLWithPath: path))
@@ -556,6 +763,41 @@ import NXModel
             let metadata = try MacGameBundle.read(url)
             print("Discovered Mac build: \(metadata.name) (\(metadata.titleID))")
         }
+    }
+
+    private func hiddenBuildWindow(stores: LauncherStores, library: GameLibrary) -> NSWindow {
+        let view = LauncherView(stores: stores, library: library, initialPage: .builds, performStartupChecks: false)
+        let appeared = expectation(description: "Build view appeared")
+        let window = OffscreenWindow(size: NSSize(width: 1100, height: 800))
+        window.contentView = NSHostingView(rootView: view.onAppear { appeared.fulfill() })
+        window.orderFront(nil)
+        wait(for: [appeared], timeout: 5)
+        window.orderOut(nil) // Registration must work even while the launcher is hidden.
+        return window
+    }
+
+    func testBuildStartingAtFirstAppearanceKeepsItsLibraryEntry() throws {
+        let stores = LauncherStores(defaults: testDefaults)
+        let model = stores.build
+        model.slots[0].paths = [temporary.appendingPathComponent("Test [\(titleID)].nsp").path]
+        model.target = "mac-app"
+        model.outDir = temporary.path
+        let app = try makeApp(titleID)
+        let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        let window = hiddenBuildWindow(stores: stores, library: library)
+        defer { window.close() }
+
+        // Start before the initial idle notification's deferred work, then finish on the next main-queue turn.
+        model.running = true
+        let finished = expectation(description: "Completion callbacks ran")
+        DispatchQueue.main.async {
+            model.macAppPath = app.path
+            model.running = false
+            model.done = true
+            DispatchQueue.main.async { finished.fulfill() }
+        }
+        wait(for: [finished], timeout: 5)
+        XCTAssertEqual(library.games.first?.appPath, app.path)
     }
 
     @MainActor func testCompletedBuildAppearsAutomaticallyInCollection() throws {
@@ -604,24 +846,17 @@ import NXModel
         model.slots[0].paths = [base.path]
         model.slots[3].paths = [keys.path]
         let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
-        let host = NSHostingView(rootView: LauncherView(stores: modelStores, library: library, initialPage: .builds, performStartupChecks: false))
-        let window = OffscreenWindow(size: NSSize(width: 1100, height: 800))
-        window.contentView = host
-        window.orderFront(nil)
-        defer { window.orderOut(nil) }
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        let window = hiddenBuildWindow(stores: modelStores, library: library)
+        defer { window.close() }
         let completed = expectation(description: "Successful app is added without an import")
-        let token = library.$games.filter { $0.contains(where: \.isReady) }.prefix(1).sink { _ in completed.fulfill() }
+        let libraryToken = library.$games.filter { $0.contains(where: \.isReady) }.prefix(1).sink { _ in completed.fulfill() }
+        let settled = expectation(description: "Build process finished successfully")
+        let buildToken = model.$running.combineLatest(model.$done).first { !$0 && $1 }.sink { _ in settled.fulfill() }
         XCTAssertTrue(model.canBuild)
-        window.orderOut(nil) // Registration must work even while the launcher is hidden.
         model.startBuild()
-        // The fixture runs system Python in a child process. A loaded CI runner took more than 10 s for it once, so the deadline
-        // is only a hang guard. Each wait returns on its event, so a fast build does not wait longer.
-        wait(for: [completed], timeout: 120)
-        withExtendedLifetime(token) {}
-        // The library can list the app before the model has taken in the script's exit (a slower Mac, CI): wait for both
-        let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in model.done && !model.running }, object: nil)
-        wait(for: [settled], timeout: 120)
+        // A ready app and the process exit may arrive in either order. The timeout only guards against a hang on CI.
+        wait(for: [completed, settled], timeout: 120)
+        withExtendedLifetime((libraryToken, buildToken)) {}
         XCTAssertTrue(model.done)
         XCTAssertFalse(model.running)
         XCTAssertEqual(model.stages.map(\.name), ["Mac app"])   // from the JSON events, which the log shows as text
@@ -786,8 +1021,26 @@ import NXModel
             window.orderOut(nil)
         }
         try capture("library")
+        do {   // #907: a second player in the top bar, and the sheet that names a new one
+            modelStores.players.create(name: "Ana")
+            defer { modelStores.players.remove("ana") }
+            try capture("library-player")
+            let sheet = PlayerNameSheet(players: modelStores.players, renaming: nil, close: {})
+                .environmentObject(modelStores.localizer).background(LauncherPalette.background).preferredColorScheme(.dark)
+            let host = NSHostingView(rootView: sheet)
+            let window = OffscreenWindow(size: NSSize(width: 380, height: 200), styleMask: [.borderless])
+            window.contentView = host
+            window.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            host.layoutSubtreeIfNeeded()
+            let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: output.appendingPathComponent("player-new.png"))
+            window.orderOut(nil)
+        }
         try capture("library-search", search: "zel")
         try capture("library-small", width: 900, height: 680)
+        try capture("library-small-search", width: 900, height: 680, search: "zel")
         try capture("manage-menu", manageOpen: true)   // the Manage menu open, mouse look
         try capture("manage-menu-pad", manageOpen: true, padRing: true)   // opened by the controller: the ring on the first row
         try capture("manage-menu-small", width: 900, height: 680, manageOpen: true, padRing: true)
@@ -830,6 +1083,8 @@ import NXModel
             modelStores.appUpdates.status = String(format: model.t("app.ready"), release.tag)
             try capture("settings-update-ready", page: .settings)
             try capture("library-update-ready")
+            try capture("library-small-update", width: 900, height: 680)
+            try capture("library-small-search-update", width: 900, height: 680, search: "zel")
         }
         // Games built with older build tools (ToolsAge): the selected one rebuilt from its own inputs, as a recorded build has them
         model.slots[0].paths = ["/preview/Hades [\(titleID)].nsp"]
@@ -914,10 +1169,7 @@ import NXModel
             window.orderOut(nil)
         }
         do {   // the Controls sheet with a few changes, kept in a suite of its own
-            let suite = "nxnative-visual-qa-controls"
-            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-            defaults.removePersistentDomain(forName: suite)
-            defer { defaults.removePersistentDomain(forName: suite) }
+            let defaults = TestDefaults.make("nxnative-visual-qa-controls")
             let layout = ControlLayout(defaults: defaults)
             if let up = ControlLayout.functions.first(where: { $0.id == "RUp" }) { layout.assign(up, key: 34) }
             layout.setSends("A", "B"); layout.setSends("B", "A")
@@ -978,10 +1230,7 @@ import NXModel
         // ---- Controller layouts (#70): the Controls sheet scrolled to the layout by the controller's focus, Auto with a
         // stand-in Xbox controller, then By label with none connected (a suite of its own; no real controller is read) ----
         do {
-            let suite = "nxnative-visual-qa-control-presets"
-            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-            defaults.removePersistentDomain(forName: suite)
-            defer { defaults.removePersistentDomain(forName: suite) }
+            let defaults = TestDefaults.make("nxnative-visual-qa-control-presets")
             for (name, mode, category) in [("controls-layout-auto", PadMode.auto, "Xbox One" as String?), ("controls-layout-bylabel", .byLabel, nil)] {
                 let layout = ControlLayout(defaults: defaults)
                 layout.controllerCategory = { category }
@@ -1155,5 +1404,247 @@ import NXModel
         try FileManager.default.createDirectory(at: extract.appendingPathComponent("v1").appendingPathComponent("RomFS"),
                                                 withIntermediateDirectories: true)
         XCTAssertEqual(RomFSArchive.extractedVersion(in: extract.path), "v1")
+    }
+
+    func testSharedShellInstallAndSyncPropagateToAllShellGames() throws {
+        let shellRoot = temporary.appendingPathComponent("shell")
+        let shellApp = shellRoot.appendingPathComponent("derived-data/Build/Products/Release-iphoneos/DmShell.app")
+        try FileManager.default.createDirectory(at: shellApp, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: shellApp.appendingPathComponent("Info.plist"))
+        try Data("profile".utf8).write(to: shellApp.appendingPathComponent("embedded.mobileprovision"))
+        try ShellLibrary(games: [
+            ShellLibrary.Game(titleID: "0100CD801CE5E000", name: "Balatro", framework: "DmGame0100CD801CE5E000.framework"),
+            ShellLibrary.Game(titleID: "0100E65002BB8000", name: "Stardew Valley", framework: "DmGame0100E65002BB8000.framework"),
+        ]).save(root: shellRoot.path)
+
+        let file = temporary.appendingPathComponent("library.json")
+        let g1 = LibraryGame(titleID: "0100CD801CE5E000", name: "Balatro")
+        let g2 = LibraryGame(titleID: "0100E65002BB8000", name: "Stardew Valley")
+        let g3 = LibraryGame(titleID: "01007EF00011E000", name: "Breath of the Wild")
+        try JSONEncoder().encode([g1, g2, g3]).write(to: file)
+
+        let library = GameLibrary(file: file)
+        library.recordCompletedIOS(archive: "", app: shellApp.path, device: "00008150-TESTDEVICE", for: g1.id)
+        XCTAssertEqual(library.games[0].iosAppPath, shellApp.path)
+        XCTAssertEqual(library.games[0].installedDevice, "00008150-TESTDEVICE")
+        XCTAssertEqual(library.games[1].iosAppPath, shellApp.path, "other games in shell.json share DmShell.app")
+        XCTAssertEqual(library.games[1].installedDevice, "00008150-TESTDEVICE")
+        XCTAssertEqual(library.games[2].iosAppPath, "", "a game outside shell.json is untouched")
+
+        library.recordSharedAppInstalled(app: shellApp.path, device: "00008150-SECOND")
+        XCTAssertEqual(library.games[0].installedDevice, "00008150-SECOND")
+        XCTAssertEqual(library.games[1].installedDevice, "00008150-SECOND")
+
+        // If an external tool cleared iosAppPath on one of the shared-shell games while a peer entry kept its provenance, syncSharedApp restores it.
+        var cleared = library.games
+        cleared[1].iosAppPath = ""
+        cleared[1].installedDevice = ""
+        try JSONEncoder().encode(cleared).write(to: file)
+        let reloaded = GameLibrary(file: file)
+        XCTAssertFalse(reloaded.games[1].onDevice)
+        reloaded.syncSharedApp(root: shellRoot.path)
+        XCTAssertTrue(reloaded.games[1].onDevice)
+        XCTAssertEqual(reloaded.games[1].iosAppPath, shellApp.path)
+        XCTAssertEqual(reloaded.games[1].installedDevice, "00008150-SECOND")
+    }
+
+    func testSyncSharedAppDoesNotInferInstallFromSignedLocalAppAfterFailedInstall() throws {
+        let shellRoot = temporary.appendingPathComponent("shell-failed-install")
+        let shellApp = shellRoot.appendingPathComponent("derived-data/Build/Products/Release-iphoneos/DmShell.app")
+        try FileManager.default.createDirectory(at: shellApp, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: shellApp.appendingPathComponent("Info.plist"))
+        // Signing succeeded and shell.json was saved before devicectl failed, leaving embedded.mobileprovision on disk.
+        try Data("profile".utf8).write(to: shellApp.appendingPathComponent("embedded.mobileprovision"))
+        try ShellLibrary(games: [
+            ShellLibrary.Game(titleID: "0100CD801CE5E000", name: "Balatro", framework: "DmGame0100CD801CE5E000.framework"),
+        ]).save(root: shellRoot.path)
+
+        let ipa = temporary.appendingPathComponent("Balatro.ipa")
+        try Data("ipa".utf8).write(to: ipa)
+
+        let file = temporary.appendingPathComponent("library.json")
+        var uninstalled = LibraryGame(titleID: "0100CD801CE5E000", name: "Balatro")
+        uninstalled.ipaPath = ipa.path
+        try JSONEncoder().encode([uninstalled]).write(to: file)
+
+        let library = GameLibrary(file: file)
+        library.syncSharedApp(root: shellRoot.path)
+        XCTAssertFalse(library.games[0].onDevice, "a signed local DmShell.app without recorded install provenance must not mark the game as installed")
+        XCTAssertEqual(library.games[0].installedDevice, "")
+        XCTAssertEqual(library.games[0].iosAppPath, "")
+        XCTAssertEqual(library.games[0].ipaPath, ipa.path, "remembered IPA path must not be cleared when the shared app was never installed")
+    }
+
+    func testSyncSharedAppDoesNotMarkNewGameInstalledWhenItsDeviceInstallFailedAfterEarlierPeerSucceeded() throws {
+        let shellRoot = temporary.appendingPathComponent("shell-partial-install")
+        let shellApp = shellRoot.appendingPathComponent("derived-data/Build/Products/Release-iphoneos/DmShell.app")
+        try FileManager.default.createDirectory(at: shellApp, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: shellApp.appendingPathComponent("Info.plist"))
+        try Data("profile".utf8).write(to: shellApp.appendingPathComponent("embedded.mobileprovision"))
+
+        let ipaB = temporary.appendingPathComponent("Stardew.ipa")
+        try Data("ipa".utf8).write(to: ipaB)
+
+        let file = temporary.appendingPathComponent("library.json")
+        let gameA = LibraryGame(titleID: "0100CD801CE5E000", name: "Balatro")
+        var gameB = LibraryGame(titleID: "0100E65002BB8000", name: "Stardew Valley")
+        gameB.ipaPath = ipaB.path
+        try JSONEncoder().encode([gameA, gameB]).write(to: file)
+
+        // 1. Install game A successfully.
+        let entryA = ShellLibrary.Game(titleID: "0100CD801CE5E000", name: "Balatro", framework: "DmGame0100CD801CE5E000.framework")
+        let entryB = ShellLibrary.Game(titleID: "0100E65002BB8000", name: "Stardew Valley", framework: "DmGame0100E65002BB8000.framework")
+        try ShellLibrary(games: [entryA]).save(root: shellRoot.path)
+        let library = GameLibrary(file: file)
+        library.recordCompletedIOS(archive: "", app: shellApp.path, device: "EXISTING-DEVICE", for: gameA.id)
+        XCTAssertTrue(library.games[0].onDevice)
+        XCTAssertFalse(library.games[1].onDevice)
+        XCTAssertEqual(library.games[1].ipaPath, ipaB.path)
+
+        // 2. Build B so the current shared shell.json contains A and B, but let B's device install fail.
+        try ShellLibrary(games: [entryA, entryB]).save(root: shellRoot.path)
+
+        // 3. Restart the launcher.
+        let relaunched = GameLibrary(file: file)
+        relaunched.syncSharedApp(root: shellRoot.path)
+        XCTAssertTrue(relaunched.games[0].onDevice)
+        XCTAssertEqual(relaunched.games[0].installedDevice, "EXISTING-DEVICE")
+        XCTAssertEqual(relaunched.games[0].iosAppPath, shellApp.path)
+        XCTAssertFalse(relaunched.games[1].onDevice, "B's failed device install must not be marked installed from A's earlier receipt")
+        XCTAssertEqual(relaunched.games[1].installedDevice, "")
+        XCTAssertEqual(relaunched.games[1].iosAppPath, "")
+        XCTAssertEqual(relaunched.games[1].ipaPath, ipaB.path, "B's remembered IPA must stay intact after a failed device install")
+    }
+
+    func testConcurrentFolderRescanQueuesLatestRootsWithoutPrematureIdleAndDropsRemovedFolderInFlight() throws {
+        let rootA = temporary.appendingPathComponent("scan-root-a")
+        let rootB = temporary.appendingPathComponent("scan-root-b")
+        try FileManager.default.createDirectory(at: rootA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+        try Data([1]).write(to: rootA.appendingPathComponent("Game A [010000000000A000][v0].nsp"))
+        try Data([1]).write(to: rootB.appendingPathComponent("Game B [010000000000B000][v0].nsp"))
+
+        let library = GameLibrary(file: temporary.appendingPathComponent("library-concurrent.json"))
+        library.applicationFolders = []
+
+        let enteredFirstPass = DispatchSemaphore(value: 0)
+        let releaseFirstPass = DispatchSemaphore(value: 0)
+        final class CounterBox: @unchecked Sendable {
+            let lock = NSLock()
+            var count = 0
+            func next() -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                count += 1
+                return count
+            }
+        }
+        let passCounter = CounterBox()
+        library.onBackgroundScanStart = {
+            if passCounter.next() == 1 {
+                enteredFirstPass.signal()
+                releaseFirstPass.wait()
+            }
+        }
+
+        var scanningTransitions: [Bool] = []
+        let finished = expectation(description: "queued rescan finished")
+        let cancellable = library.$scanning.dropFirst().sink { isScanning in
+            scanningTransitions.append(isScanning)
+            if !isScanning {
+                finished.fulfill()
+            }
+        }
+
+        library.addFolder(rootA)
+        XCTAssertEqual(enteredFirstPass.wait(timeout: .now() + 5), .success)
+        library.addFolder(rootB)
+        releaseFirstPass.signal()
+
+        wait(for: [finished], timeout: 5)
+        withExtendedLifetime(cancellable) {}
+        XCTAssertEqual(scanningTransitions, [true, false], "scanning must remain continuously true until the queued pass finishes")
+        XCTAssertEqual(Set(library.games.map(\.titleID)), ["010000000000A000", "010000000000B000"])
+
+        // Removing the only folder while its background scan is in flight must drop the stale scan result instead of writing it back.
+        let rootC = temporary.appendingPathComponent("scan-root-c")
+        try FileManager.default.createDirectory(at: rootC, withIntermediateDirectories: true)
+        try Data([1]).write(to: rootC.appendingPathComponent("Game C [010000000000C000][v0].nsp"))
+
+        let fileRemoved = temporary.appendingPathComponent("library-removed-inflight.json")
+        let libraryRemoved = GameLibrary(file: fileRemoved)
+        libraryRemoved.applicationFolders = []
+        let enteredRemovedPass = DispatchSemaphore(value: 0)
+        let releaseRemovedPass = DispatchSemaphore(value: 0)
+        libraryRemoved.onBackgroundScanStart = {
+            enteredRemovedPass.signal()
+            releaseRemovedPass.wait()
+        }
+
+        libraryRemoved.addFolder(rootC)
+        XCTAssertEqual(enteredRemovedPass.wait(timeout: .now() + 5), .success)
+        libraryRemoved.removeFolder(rootC.path)
+        XCTAssertFalse(libraryRemoved.scanning)
+        releaseRemovedPass.signal()
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertTrue(libraryRemoved.games.isEmpty, "stale scan from a removed folder must not repopulate games")
+        let reloaded = GameLibrary(file: fileRemoved)
+        XCTAssertTrue(reloaded.games.isEmpty)
+    }
+
+    func testMacGameBundleCachesInfoPlistReadsAndInvalidatesOnChangeOrMissingExecutable() throws {
+        let app = temporary.appendingPathComponent("CachedGame.app")
+        let macOS = app.appendingPathComponent("Contents/MacOS")
+        let plistURL = app.appendingPathComponent("Contents/Info.plist")
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        for exe in ["nxnative", "dmhost"] {
+            try FileManager.default.createSymbolicLink(at: macOS.appendingPathComponent(exe), withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
+        }
+        let infoV1: [String: Any] = [
+            "DMTitleID": titleID,
+            "CFBundleDisplayName": "Cached Game",
+            "CFBundleExecutable": "nxnative",
+            "CFBundleIdentifier": bundleID,
+            "DMPackageVersion": "v65536",
+            "DMDisplayVersion": "1.0.0",
+        ]
+        try PropertyListSerialization.data(fromPropertyList: infoV1, format: .xml, options: 0).write(to: plistURL)
+
+        var game = LibraryGame(titleID: titleID, name: "Cached Game")
+        game.appPath = app.path
+
+        #if DEBUG
+        LauncherWork.reset()
+        #endif
+        for _ in 0..<10 {
+            XCTAssertTrue(game.isReady)
+            XCTAssertEqual(game.playVersion, "1.0.0")
+            XCTAssertEqual(game.primary, .play)
+        }
+        #if DEBUG
+        XCTAssertEqual(LauncherWork.counts[.infoPlistRead, default: 0], 1, "repeated main-thread bundle checks must hit the Info.plist cache")
+        #endif
+
+        var infoV2 = infoV1
+        infoV2["DMDisplayVersion"] = "1.2.0"
+        try PropertyListSerialization.data(fromPropertyList: infoV2, format: .xml, options: 0).write(to: plistURL)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(3)], ofItemAtPath: plistURL.path)
+        XCTAssertEqual(game.playVersion, "1.2.0", "updated Info.plist must invalidate the cached metadata")
+
+        try FileManager.default.removeItem(at: macOS.appendingPathComponent("dmhost"))
+        XCTAssertFalse(game.isReady, "missing dmhost executable must invalidate readiness immediately")
+    }
+
+    func testSourceGamesIgnoresStrayIPAFilesBesideGamePackages() throws {
+        let root = temporary.appendingPathComponent("ipa-dead-branch")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data([1]).write(to: root.appendingPathComponent("Game D [010000000000D000][v0].nsp"))
+        try Data([1]).write(to: root.appendingPathComponent("Old Export [010000000000D000].ipa"))
+        try Data([1]).write(to: root.appendingPathComponent("Standalone [010000000000E000].ipa"))
+
+        let found = GameLibrary.sourceGames(in: root, repo: "")
+        XCTAssertEqual(found.map(\.titleID), ["010000000000D000"])
+        XCTAssertEqual(found.first?.ipaPath, "")
     }
 }

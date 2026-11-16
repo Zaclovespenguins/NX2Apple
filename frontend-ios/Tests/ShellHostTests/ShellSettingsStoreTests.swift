@@ -62,6 +62,25 @@ import ShellUI
         #expect(store.defaults.object(forKey: ShellSettingsStore.touchStickKey) == nil && store.gameDefaults == ["DM_TOUCH_SIZE": "small"])
     }
 
+    /// The arrangement (#414) is stored as the engine's value and goes to every game as DM_TOUCH_LAYOUT. Reset removes it per layout.
+    @Test func theArrangementGoesToEveryGameAndResetRemovesIt() {
+        let store = shell()
+        #expect(store.touchLayout.isEmpty && store.gameDefaults["DM_TOUCH_LAYOUT"] == nil, "settings saved before the editor: the built-in layout")
+        var layout = TouchLayout()
+        layout[.twoD, .stick] = TouchLayout.Offset(dx: 1, dy: -2)
+        layout[.threeD, .a] = TouchLayout.Offset(dx: -1, dy: 0)
+        store.storeTouchLayout(layout)
+        #expect(store.defaults.string(forKey: ShellSettingsStore.touchLayoutKey) == "1;2d/stick:1,-2;3d/a:-1,0")
+        #expect(ShellSettingsStore(defaults: store.defaults).touchLayout == layout)
+        #expect(store.gameDefaults == ["DM_TOUCH_LAYOUT": "1;2d/stick:1,-2;3d/a:-1,0"])
+        store.resetTouchLayout(.twoD)
+        #expect(store.gameDefaults == ["DM_TOUCH_LAYOUT": "1;3d/a:-1,0"])
+        store.resetTouchLayout(.threeD)
+        #expect(store.defaults.object(forKey: ShellSettingsStore.touchLayoutKey) == nil && store.gameDefaults.isEmpty)
+        store.defaults.set("1;2d/a:99,0", forKey: ShellSettingsStore.touchLayoutKey)
+        #expect(store.touchLayout.isEmpty && store.gameDefaults.isEmpty, "a stored value the engine would ignore is not passed")
+    }
+
     @Test func theFolderNamesAreKept() {
         let store = shell()
         store.storeDataFolderName("Switch")
@@ -91,5 +110,52 @@ import ShellUI
         #expect(defaults.object(forKey: "launcher.DM_SHOW_FPS") == nil, "a choice equal to the shell's value follows the shell again")
         store = GameSettingsStore(profile: profile, defaults: defaults, shell: ["DM_OPMODE": "7"])
         #expect(store.values()["DM_OPMODE"] == "1", "a value the game does not offer is ignored")
+    }
+
+    @Test func aSavedGamePadLayoutWinsTheGlobalTouchMode() throws {
+        let profile = try LauncherProfile.parse(Data("""
+        {"schema":1,"game":"0100000000010000","settings":[{"env":"DM_PROF_PAD_LAYOUT","kind":"choice","section":"Touch","label":"Layout","note":"","default":"2","options":[["0","2D"],["1","3D"],["2","Tap"]]}]}
+        """.utf8))
+        let defaults = UserDefaults(suiteName: "t-game-touch-\(UUID().uuidString)")!
+        let shell = shell()
+        shell.storeTouchMode("3d")
+        let game = GameSettingsStore(profile: profile, defaults: defaults, shell: shell.gameDefaults)
+        let layout = try #require(profile.settings.first { $0.env == "DM_PROF_PAD_LAYOUT" })
+
+        #expect(game.values()[layout.env] == "1" && game.isFromShell(layout))
+        game.set(layout.env, to: "0")
+        #expect(game.values()[layout.env] == "0" && !game.isFromShell(layout))
+        game.reset()
+        #expect(game.values()[layout.env] == "1" && game.isFromShell(layout))
+        #expect(GameSettingsStore(profile: profile, defaults: defaults).values()[layout.env] == "2", "an unset shell mode preserves the game's Tap default")
+    }
+
+    @Test func audioMixDefaultsOffPersistsAndClearsKeyWhenDisabled() {
+        let store = shell()
+        #expect(!store.audioMix)
+        #expect(store.defaults.object(forKey: ShellSettingsStore.audioMixKey) == nil)
+        #expect(store.gameDefaults["DM_AUDIO_MIX"] == nil)
+
+        store.storeAudioMix(true)
+        #expect(store.audioMix)
+        #expect(store.gameDefaults["DM_AUDIO_MIX"] == "1")
+        #expect(ShellSettingsStore(defaults: store.defaults).audioMix)
+
+        store.storeAudioMix(false)
+        #expect(!store.audioMix)
+        #expect(store.defaults.object(forKey: ShellSettingsStore.audioMixKey) == nil)
+        #expect(store.gameDefaults["DM_AUDIO_MIX"] == nil)
+    }
+
+    @Test func legacyTouchToggleDefaultsAreIgnoredWhileTouchSizeAndStickRemain() {
+        let store = shell()
+        store.defaults.set("b,zr", forKey: "touchToggle")
+        store.storeTouchSize("large")
+        store.storeTouchStick("inward")
+
+        #expect(store.touchLayout.isEmpty)
+        #expect(store.gameDefaults["DM_TOUCH_TOGGLE"] == nil)
+        #expect(store.gameDefaults["DM_TOUCH_SIZE"] == "large")
+        #expect(store.gameDefaults["DM_TOUCH_STICK"] == "inward")
     }
 }

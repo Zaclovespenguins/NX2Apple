@@ -35,12 +35,14 @@ PACKAGING = (
     'frontend/Package.swift',
     'frontend/Package.resolved',
     'frontend/engine-signing.pub',
+    'frontend/nxbuild.pin',
     'frontend/Resources/',
     'frontend/AppIcon.icon/',
     'frontend/bundled-python/',
     'frontend/fonts/',
     'frontend/tools/',
     'frontend-ios/Package.swift',
+    'frontend-ios/Shell/',
 )
 
 

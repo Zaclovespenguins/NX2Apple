@@ -94,36 +94,41 @@ def engine_dir(root):
 def pin(root):
     f = root / '.upstream-ref'
     if not f.is_file(): raise Fail(f'{f} is missing: this is not an NX2Apple checkout')
-    sha = f.read_text().strip()
+    sha = f.read_text(encoding='utf-8').strip()
     if not re.fullmatch(r'[0-9a-f]{40}', sha): raise Fail(f'.upstream-ref must hold a full commit id (is: {sha!r})')
     return sha
 
 
 def stamp_key(root):
-    """The digest of what engine/ is built from: the pin, and each patch of the series by name and content, in order.
-    frontend/Sources/NXCore/EngineLayout.swift and frontend-qt/nspb_qt/engine.py compute the same, so the launchers can
-    tell a stale engine/ without starting Python."""
+    """The digest of what engine/ is built from: the pin, each patch of the series by name and content, in order, and
+    patches/fork_env_switches.tsv when present. frontend/Sources/NXCore/EngineLayout.swift and frontend-qt/nspb_qt/engine.py
+    compute the same, so the launchers can tell a stale engine/ without starting Python."""
     h = hashlib.sha256()
     h.update(b'pin ' + pin(root).encode() + b'\n')
     for name in P.read_series(root):
         f = root / 'patches' / name
         if not f.is_file(): raise Fail(f'listed in patches/series but missing: {name}')
         h.update(b'patch ' + name.encode() + b'\n' + hashlib.sha256(f.read_bytes()).hexdigest().encode() + b'\n')
+    sw = root / P.FORK_ENV_SWITCHES
+    if sw.is_file():
+        h.update(b'switches ' + hashlib.sha256(sw.read_bytes()).hexdigest().encode() + b'\n')
     return h.hexdigest()
 
 
 def read_stamp(eng):
-    try: text = (eng / '.git' / STAMP).read_text()
+    try: text = (eng / '.git' / STAMP).read_text(encoding='utf-8')
     except OSError: return {}
     return dict(l.split(' ', 1) for l in text.splitlines() if ' ' in l)
 
 
 def write_stamp(eng, root, head, key=None):
-    (eng / '.git' / STAMP).write_text(f'nx2apple-engine 1\npin {pin(root)}\nkey {key or stamp_key(root)}\nhead {head}\n')
+    (eng / '.git' / STAMP).write_text(f'nx2apple-engine 1\npin {pin(root)}\nkey {key or stamp_key(root)}\nhead {head}\n', encoding='utf-8')
 
 
 def is_repo(eng):
-    return (eng / '.git').is_dir() and git('rev-parse', '--show-toplevel', cwd=eng, check=False).stdout.strip() == str(eng.resolve())
+    if not (eng / '.git').is_dir(): return False
+    top = git('rev-parse', '--show-toplevel', cwd=eng, check=False).stdout.strip()
+    return bool(top) and Path(top).resolve() == eng.resolve()
 
 
 def head(eng):
@@ -191,12 +196,21 @@ def fetch(eng, sha, url=None):
 
 
 def ensure_repo(eng):
-    if is_repo(eng): return
+    if is_repo(eng):
+        git('config', 'core.autocrlf', 'false', cwd=eng)
+        return
     if eng.exists() and any(eng.iterdir()):
-        raise Fail(f'{eng} exists but is not a git repository made by tools/engine.py: move it away, then run sync again')
+        if not any(f.is_file() for f in eng.rglob('*')):
+            # An empty tree is the leftover of a failed first sync: on Windows the engine sync
+            # needs git, and the failure hit right after this folder was made, so every retry
+            # then stopped here forever ("move it away"). Start over instead of asking.
+            shutil.rmtree(eng, ignore_errors=True)
+        else:
+            raise Fail(f'{eng} exists but is not a git repository made by tools/engine.py: move it away, then run sync again')
     eng.mkdir(parents=True, exist_ok=True)
     git('init', '--quiet', cwd=eng)
     git('config', 'advice.detachedHead', 'false', cwd=eng)
+    git('config', 'core.autocrlf', 'false', cwd=eng)
     git('remote', 'add', 'seedds', UPSTREAM_URL, cwd=eng, check=False)   # for `git fetch seedds` and pull requests upstream
 
 
@@ -216,9 +230,16 @@ def build(root, eng, patches, sha):
         say('empty on the pin (upstream has them, `tools/engine.py bump` drops them): ' + ', '.join(p.file for p in landed))
     for out, tool in P.GENERATED:
         if (eng / tool).is_file():
-            r = subprocess.run([sys.executable, str(eng / tool)], cwd=eng, capture_output=True, text=True, check=False, env=P.clean_env())
+            if out == 'docs/env_switches.tsv':
+                P.merge_env_switches(root, eng)
+            r = subprocess.run([sys.executable, '-X', 'utf8', str(eng / tool)], cwd=eng, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False, env=P.clean_env())
             if r.returncode: raise Fail(f'{tool} failed on the patched tree: {(r.stderr.strip().splitlines() or [str(r.returncode)])[-1]}')
-    (eng / P.FORK_PATCHES).write_text(P.fork_patch_list([p for p, _ in applied]))
+            if out == 'docs/env_switches.tsv':
+                chk = subprocess.run([sys.executable, '-X', 'utf8', str(eng / tool), '--check'], cwd=eng, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False, env=P.clean_env())
+                if chk.returncode:
+                    msg = (chk.stdout + '\n' + chk.stderr).strip().splitlines()
+                    raise Fail(f'{tool} --check failed (add new switches to {P.FORK_ENV_SWITCHES}): {msg[-1] if msg else chk.returncode}')
+    (eng / P.FORK_PATCHES).write_text(P.fork_patch_list([p for p, _ in applied]), encoding='utf-8')
     git('add', '--force', '--', P.FORK_PATCHES, *(o for o, _ in P.GENERATED if (eng / o).exists()), cwd=eng)
     git(*IDENT, 'commit', '--quiet', '--allow-empty', '-m', GENERATED_SUBJECT, cwd=eng)
     return applied, landed
@@ -373,8 +394,8 @@ def cmd_tree(a):
     out.mkdir(parents=True, exist_ok=True)
     n = extract_tree(eng, out)
     eid = engine_id(root)
-    (out / '.upstream-ref').write_text(pin(root) + '\n')
-    (out / ENGINE_ID_FILE).write_text(eid + '\n')
+    (out / '.upstream-ref').write_text(pin(root) + '\n', encoding='utf-8')
+    (out / ENGINE_ID_FILE).write_text(eid + '\n', encoding='utf-8')
     if not (out / P.FORK_PATCHES).is_file(): raise Fail(f'{P.FORK_PATCHES} is missing from engine/: sync again')
     say(f'engine tree: {eid} ({n} files) in {out}')
     if a.zip:
@@ -406,6 +427,22 @@ def cmd_export(a):
     made = []
     for c in commits:
         if git('log', '-1', '--format=%s', c, cwd=eng).stdout.strip() == GENERATED_SUBJECT: continue
+        if (eng / 'docs/env_switches.tsv').is_file() and have_commit(eng, pin(root)):
+            up_tsv = git('show', f'{pin(root)}:docs/env_switches.tsv', cwd=eng, check=False).stdout
+            cur_tsv = git('show', f'{c}:docs/env_switches.tsv', cwd=eng, check=False).stdout
+            if up_tsv and cur_tsv:
+                up_rows = {l.split('\t', 1)[0]: l for l in up_tsv.splitlines()[1:] if l.strip()}
+                fork_tsv = root / P.FORK_ENV_SWITCHES
+                kept = {l.split('\t', 1)[0]: l for l in (fork_tsv.read_text(encoding='utf-8').splitlines()[1:] if fork_tsv.is_file() else []) if l.strip()}
+                changed = False
+                for l in cur_tsv.splitlines()[1:]:
+                    if not l.strip(): continue
+                    k = l.split('\t', 1)[0]
+                    if up_rows.get(k) != l and kept.get(k) != l:
+                        kept[k] = l; changed = True
+                if changed:
+                    fork_tsv.write_text('name\tclass\tmeaning\n' + ''.join(kept[k] + '\n' for k in sorted(kept)), encoding='utf-8')
+                    say(f'updated {P.FORK_ENV_SWITCHES}')
         text = git('format-patch', '--binary', '--zero-commit', '--no-signature', '--no-numbered', '--stdout', f'{c}^..{c}', '--', '.',
                    *(f':(exclude){o}' for o in sorted(skip)), cwd=eng, binary=True).stdout.decode(errors='surrogateescape')
         if not re.search(r'(?m)^diff --git ', text):

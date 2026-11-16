@@ -19,13 +19,16 @@ Mapped calls, and why each needs translating rather than just forwarding:
 Anything else exits 127 with a message naming the call, so an unmapped step shows up in the
 build log as a missing tool instead of silently producing a wrong result.
 
-`metal-tt` is deliberately absent: the Windows Metal tools do not ship it, and pretending it
-works would produce a half-written pipeline archive.
+`metal-tt` is resolved like any other tool: some Windows Metal builds ship it (32023.850 has
+`bin/metal-tt.exe`), older ones do not. When it is absent the call exits 127 naming it, rather
+than pretending it works and producing a half-written pipeline archive.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Importable both as `nspb_qt.win.xcrun_shim` and as a plain script (the `.cmd` stand-in runs it
@@ -125,7 +128,9 @@ def find(sdk: str, tool: str) -> Path | None:
     if tool == 'actool':
         return None            # the asset catalog is replaced by loose PNGs
     if tool == 'metal-tt':
-        return None            # not shipped by Apple's Windows Metal tools
+        # Some Windows Metal builds do ship it (32023.850 has bin/metal-tt.exe), older ones do
+        # not. Return what is actually there so the offline pipeline archive runs when it can.
+        return tc.metal_tool('metal-tt')
     if tool in TOOL_MAP:
         return tc.llvm_tool(TOOL_MAP[tool])
     return tc.llvm_tool(tool)
@@ -134,6 +139,99 @@ def find(sdk: str, tool: str) -> Path | None:
 def _die(msg: str, code: int = 127) -> None:
     print(f'xcrun (Windows): {msg}', file=sys.stderr)
     raise SystemExit(code)
+
+
+def _needs_staging(arg: str) -> bool:
+    """Whether `arg` contains spaces or non-ASCII characters that break `metal.exe` / `metallib.exe`."""
+    return ' ' in arg or not arg.isascii()
+
+
+def _safe_suffix(p: Path, default: str) -> str:
+    name = p.name
+    for ext in ('.metallib', '.air', '.pch', '.metal', '.dia', '.h'):
+        if name.endswith(ext) or f'{ext}.' in name:
+            return ext
+    sfx = p.suffix
+    return sfx if (sfx and not _needs_staging(sfx)) else default
+
+
+def _run_metal_staged(sdk: str, tool: str, exe: Path, rest: list[str]) -> int:
+    """Run `metal.exe` or `metallib.exe` in a pure-ASCII, space-free staging directory.
+
+    Apple's Windows `metal.exe` and `metallib.exe` split input paths on spaces when forwarding
+    them to their internal frontend and fail with `LLVM ERROR: Error opening '<path>'` when any
+    input or output path contains non-ASCII characters (such as Chinese folder names). Staging
+    inputs and outputs in a pure-ASCII `cwd` with plain filenames (`in_0.metal`, `out.air`,
+    `out.metallib`) keeps every argument passed to `metal.exe` and `metallib.exe` completely
+    ASCII and space-free.
+    """
+    idx = rest.index('-o')
+    out_target = Path(rest[idx + 1]).resolve()
+    compile_and_link = (tool == 'metal' and '-c' not in rest)
+    with tc.ascii_temp_dir('nspb-metal-') as td:
+        td_path = Path(td)
+        staged: list[str] = []
+        in_idx = 0
+        i = 0
+        while i < len(rest):
+            if i == idx:
+                i += 2  # skip '-o' and its output path; added back below with a local name
+                continue
+            a = rest[i]
+            if a == '-include-pch' and i + 1 < len(rest):
+                pch_arg = rest[i + 1]
+                pch_p = Path(pch_arg)
+                if not _needs_staging(pch_arg) and pch_p.is_absolute():
+                    staged.extend(['-include-pch', pch_arg])
+                else:
+                    local_pch = pch_p.name if not _needs_staging(pch_p.name) else f'in_{in_idx}.pch'
+                    in_idx += 1
+                    if pch_p.is_file():
+                        shutil.copyfile(pch_p, td_path / local_pch)
+                        for hdr in pch_p.parent.glob('*.h'):
+                            if not _needs_staging(hdr.name):
+                                shutil.copyfile(hdr, td_path / hdr.name)
+                    staged.extend(['-include-pch', local_pch])
+                i += 2
+                continue
+            if not a.startswith('-') and (a.endswith(('.metal', '.air', '.dia', '.pch', '.h'))
+                                          or (_needs_staging(a) and Path(a).is_file())):
+                src_p = Path(a)
+                if src_p.suffix == '.h' and not _needs_staging(src_p.name) and not (td_path / src_p.name).exists():
+                    local_name = src_p.name
+                else:
+                    local_name = f'in_{in_idx}{_safe_suffix(src_p, ".in")}'
+                in_idx += 1
+                if src_p.is_file():
+                    shutil.copyfile(src_p, td_path / local_name)
+                staged.append(local_name)
+            else:
+                staged.append(a)
+            i += 1
+        try:
+            if compile_and_link and out_target.suffix == '.metallib':
+                ml_exe = find(sdk, 'metallib')
+                if not ml_exe:
+                    _die(f'no Windows tool for `xcrun -sdk {sdk} metallib`')
+                r1 = subprocess.run([str(exe), *staged, '-c', '-o', 'out.air'], cwd=td)
+                if r1.returncode != 0:
+                    return r1.returncode
+                r2 = subprocess.run([str(ml_exe), 'out.air', '-o', 'out.metallib'], cwd=td)
+                if r2.returncode != 0:
+                    return r2.returncode
+                out_local = td_path / 'out.metallib'
+            else:
+                local_out_name = 'out' + _safe_suffix(out_target, '.out')
+                r = subprocess.run([str(exe), *staged, '-o', local_out_name], cwd=td)
+                if r.returncode != 0:
+                    return r.returncode
+                out_local = td_path / local_out_name
+            if out_local.is_file():
+                out_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(out_local, out_target)
+            return 0
+        except OSError as e:
+            _die(f'cannot start {exe}: {e}')
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -165,12 +263,17 @@ def main(argv: list[str] | None = None) -> int:
     exe = find(sdk, tool)
     if not exe:
         _die(f'no Windows tool for `xcrun -sdk {sdk} {tool}`'
-             + (' (the Windows Metal tools do not ship metal-tt)' if tool == 'metal-tt' else
+             + (' (this Metal Developer Tools build has no metal-tt.exe)' if tool == 'metal-tt' else
                 ' (the app is built with clang + ld64.lld, not Swift or actool)'
                 if tool in ('swiftc', 'actool') else
                 ' (see the Windows build section of frontend-qt/README.md)'))
     if tool == 'metal':
         rest = metal_args(sdk, rest)
+        if '-o' in rest and ('-c' not in rest or any(_needs_staging(x) for x in rest)):
+            return _run_metal_staged(sdk, tool, exe, rest)
+    elif tool == 'metallib':
+        if '-o' in rest and any(_needs_staging(x) for x in rest):
+            return _run_metal_staged(sdk, tool, exe, rest)
     elif tool == 'clang':
         rest = clang_args(rest)
     try:
